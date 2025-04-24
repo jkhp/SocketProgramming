@@ -170,3 +170,16 @@ void *tcpServerIpv6(void *arg)
 	close(listen_sock);
 	return 0;
 }
+
+// <-------- 멀티 스레드 -> 스레드 풀 코드 작성하기, && epoll, 일단 select 먼저 사용해보기 ---------->
+
+int main(void)
+{
+	// 멀티스레드로 두 개의 서버를 동시에 구동
+	pthread_t hThread[2];
+	pthread_create(&hThread[0], NULL, tcpServerIpv4, NULL);
+	pthread_create(&hThread[1], NULL, tcpServerIpv6, NULL);
+	pthread_join(hThread[0], NULL);
+	pthread_join(hThread[1], NULL);
+	return 0;
+}
