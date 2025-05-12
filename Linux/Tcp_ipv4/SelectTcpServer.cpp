@@ -77,7 +77,7 @@ int main(int argc, char *argv[])
             err_quit("select()");
 
         // 새 클라이언트 접속 처리
-        if (FD_ISSET(listen_sock, &rset))
+        if (FD_ISSET(listen_sock, &rset)) // 준비된 listen_sock이 있으면, 클라이언트가 접속(connect()) 하면 listen_sock이 준비 완료
         {
             addrlen = sizeof(clientaddr);
             client_sock = accept(listen_sock, (struct sockaddr *)&clientaddr, &addrlen);
