@@ -49,6 +49,12 @@ int main(int argc, char *argv[])
     retval = listen(listen_sock4, SOMAXCONN);
     if (retval == SOCKET_ERROR)
         err_quit("listen()");
+
+    // TCP listen_sock4을 넌블로킹으로 설정
+    int flags = fcntl(listen_sock4, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(listen_sock4, F_SETFL, flags);
+
     /************* tcp/Ipv4 소켓 초기화 종료 ***********/
 
     /************** TCP/Ipv6 소켓 초기화 시작 *************/
@@ -75,6 +81,12 @@ int main(int argc, char *argv[])
     retval = listen(listen_sock6, SOMAXCONN);
     if (retval == SOCKET_ERROR)
         err_quit("listen()");
+
+    // TCP listen_sock6을 넌블로킹으로 설정
+    flags = fcntl(listen_sock6, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(listen_sock6, F_SETFL, flags);
+
     /************** TCP/Ipv6 소켓 초기화 종료 *************/
 
     /************** UDP/Ipv4 소켓 초기화 시작 *************/
@@ -93,6 +105,11 @@ int main(int argc, char *argv[])
                   sizeof(udp_serveraddr));
     if (retval == SOCKET_ERROR)
         err_quit("bind()");
+
+    // UDP udp_sock을 넌블로킹으로 설정
+    flags = fcntl(udp_sock, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(udp_sock, F_SETFL, flags);
 
     /************** UDP/Ipv4 소켓 초기화 종료 *************/
 
@@ -115,6 +132,12 @@ int main(int argc, char *argv[])
     retval = bind(udp_sock6, (struct sockaddr *)&udp_serveraddr6, sizeof(udp_serveraddr6));
     if (retval == SOCKET_ERROR)
         err_quit("bind()");
+
+    // UDP udp_sock6을 넌블로킹으로 설정
+    flags = fcntl(udp_sock6, F_GETFL);
+    flags |= O_NONBLOCK;
+    fcntl(udp_sock6, F_SETFL, flags);
+
     /************** UDP/Ipv6 소켓 초기화 종료 *************/
 
     // 데이터 통신에 사용할 변수(공통)
@@ -132,6 +155,8 @@ int main(int argc, char *argv[])
         FD_ZERO(&wset);
         FD_SET(listen_sock4, &rset);
         FD_SET(listen_sock6, &rset);
+        FD_SET(udp_sock, &rset);
+        FD_SET(udp_sock6, &rset);
 
         for (int i = 0; i < nTotalSockets; i++)
         {
@@ -144,12 +169,86 @@ int main(int argc, char *argv[])
         }
 
         // select()
-        int nready =
-            select(GetMaxFDPlus1(listen_sock4, listen_sock6, udp_sock, udp_sock6), &rset, &wset, NULL, NULL);
+        int nready = select(GetMaxFDPlus1(listen_sock4, listen_sock6, udp_sock, udp_sock6), &rset, &wset, NULL, NULL);
         if (nready == SOCKET_ERROR)
             err_quit("select()");
 
-        // 새 클라이언트 접속 처리_IPV4
+        // UDP 새 클라이언트 수신 처리_IPV4 -> listen_sock이 아닌 udp_sock을 사용
+        if (FD_ISSET(udp_sock, &rset))
+        {
+            addrlen = sizeof(clientaddr4);
+            char buffer[BUFSIZE + 1]; // UDP는 단일 소켓으로 모든 클라이언트 요청을 받아서 따로 buffer를 선언, socketinfo가 사실상 무의미
+
+            retval = recvfrom(udp_sock, buffer, BUFSIZE, 0, (struct sockaddr *)&clientaddr4, &addrlen);
+
+            if (retval == SOCKET_ERROR)
+            {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) // 넌블로킹 소켓에서 데이터가 없을 때는 오류가 아님
+                {
+                    err_quit("recvfrom()");
+                    break;
+                }
+                continue;
+            }
+            else
+            {
+                buffer[retval] = '\0';
+
+                char addr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &clientaddr4.sin_addr, addr, sizeof(addr));
+                printf("[UDP/IPV4 서버] 클라이언트 접속: IP 주소=%s, 포트번호=%d\n", addr, ntohs(clientaddr4.sin_port));
+                printf("[UDP/IPV4 서버] 받은 데이터: %s\n", buffer);
+
+                // 에코 응답
+                int sendlen = retval;
+                retval = sendto(udp_sock, buffer, sendlen, 0, (struct sockaddr *)&clientaddr4, addrlen);
+                if (retval == SOCKET_ERROR)
+                {
+                    err_display("sendto()");
+                    continue;
+                }
+
+            } // end of else
+        }
+
+        // UDP 새 클라이언트 수신 처리_IPV6 -> listen_sock6이 아닌 udp_sock6을 사용
+        if (FD_ISSET(udp_sock6, &rset))
+        {
+            addrlen = sizeof(clientaddr6);
+            char buffer[BUFSIZE + 1]; // UDP는 단일 소켓으로 모든 클라이언트 요청을 받아서 따로 buffer를 선언, socketinfo가 사실상 무의미?
+
+            retval = recvfrom(udp_sock6, buffer, BUFSIZE, 0, (struct sockaddr *)&clientaddr6, &addrlen);
+
+            if (retval == SOCKET_ERROR)
+            {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) // 넌블로킹 소켓에서 데이터가 없을 때는 오류가 아님
+                {
+                    err_quit("recvfrom()");
+                    break;
+                }
+                continue;
+            }
+            else
+            {
+                buffer[retval] = '\0';
+
+                char addr[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &clientaddr6.sin6_addr, addr, sizeof(addr));
+                printf("[UDP/IPV6 서버] 클라이언트 접속: IP 주소=%s, 포트번호=%d\n", addr, ntohs(clientaddr6.sin6_port));
+                printf("[UDP/IPV6 서버] 받은 데이터: %s\n", buffer);
+
+                // 에코 응답
+                int sendlen = retval;
+                retval = sendto(udp_sock6, buffer, sendlen, 0, (struct sockaddr *)&clientaddr6, addrlen);
+                if (retval == SOCKET_ERROR)
+                {
+                    err_display("sendto()");
+                    continue;
+                }
+            } // end of else
+        }
+
+        // TCP 새 클라이언트 접속 처리_IPV4
         if (FD_ISSET(listen_sock4, &rset)) // 준비된 listen_sock이 있으면
         {
             addrlen = sizeof(clientaddr4);
@@ -179,7 +278,7 @@ int main(int argc, char *argv[])
                 continue;      // 처리할 이벤트 없으면 다음 루프로
         }
 
-        // 새 클라이언트 접속 처리_IPV6
+        // TCP 새 클라이언트 접속 처리_IPV6
         if (FD_ISSET(listen_sock6, &rset)) // 준비된 listen_sock이 있으면
         {
             addrlen = sizeof(clientaddr6);
@@ -216,6 +315,7 @@ int main(int argc, char *argv[])
             if (FD_ISSET(SocketInfoArray[i]->sock, &rset))
             {
                 retval = recv(SocketInfoArray[i]->sock, SocketInfoArray[i]->buf, BUFSIZE, 0);
+
                 if (retval == SOCKET_ERROR)
                 {
                     err_display("recv()");
@@ -255,19 +355,23 @@ int main(int argc, char *argv[])
 
                     // 받은 데이터 출력
                     printf("[TCP/%s 서버] 받은 데이터: %s\n", SocketInfoArray[i]->isIpv6 ? "Ipv6" : "Ipv4", SocketInfoArray[i]->buf);
-                }
+                } // end of else
             }
 
             // 데이터 송신 (echo server)
             else if (FD_ISSET(SocketInfoArray[i]->sock, &wset))
             {
+
                 retval = send(SocketInfoArray[i]->sock, SocketInfoArray[i]->buf + SocketInfoArray[i]->sendbytes,
                               SocketInfoArray[i]->recvbytes - SocketInfoArray[i]->sendbytes, 0); // '전송할 데이터 주소 계산' 및 '보낼 데이터 크기 계산'을위해 sendbytes를 이용
+
+                // 송신 오류 처리
                 if (retval == SOCKET_ERROR)
                 {
                     err_display("send()");
                     RemoveSocketInfo(i);
                 }
+                // 정상 송신
                 else
                 {
                     SocketInfoArray[i]->sendbytes += retval;
@@ -275,14 +379,24 @@ int main(int argc, char *argv[])
                         SocketInfoArray[i]->recvbytes = SocketInfoArray[i]->sendbytes = 0; // 0으로 초기화
                 }
             }
-        }
-    }
+        } // end of for (송수신 처리)
+    } // end of while(1)
 
     // 소켓 닫기
     close(listen_sock4);
     close(listen_sock6);
     close(udp_sock);
     close(udp_sock6);
+
+    for (int i = 0; i < nTotalSockets; i++)
+    {
+        if (SocketInfoArray[i] != NULL)
+        {
+            close(SocketInfoArray[i]->sock);
+            delete SocketInfoArray[i];
+        }
+    }
+
     return 0;
 }
 
