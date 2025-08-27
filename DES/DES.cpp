@@ -1,36 +1,87 @@
 #include <cstring>
 #include <cstdint>
 
+#include "DES.h"
 #include "InitialPermutation.h"
 #include "FeistelRound.h"
 #include "FinalPermutation.h"
 #include "KeySchedule.h"
 
-uint64_t streamKey; // 전역으로 사용하면 멀티스레딩, 재사용시 문제 발생 가능성 -> 전역변수 사용 안하는 것으로, 호출자 측에서 관리 (구조체 또는 클래스)
-uint64_t *roundKey;
-
-// const char* 형태로 받아서 암호화된 uint64_t를 반환하는 함수 ---> encryption, decryption 매개변수와 반환형 변경 필요 ()
-uint64_t *DES_Encryption(const char *input)
+const char *DES_Encryption(const char *input, const char *key, DesContext &context)
 {
-    int blockNum = 0;
+    uint64_t *inputBlock = StringToBlocks(input, context.blockNum, context.len); // context에 blockNum, len 저장
+    int blockNum = context.blockNum;
 
-    uint64_t *inputBlock = StringTo64BitBlocks(input, blockNum);
-    streamKey = inputBlock[0];               // inputBlock의 첫 번째 64비트를 키로 사용
-    roundKey = GenerateRoundKeys(streamKey); // 키 생성 함수, KeySchedule.cpp에서 정의되어 있다고 가정
+    uint64_t streamKey = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        streamKey = (streamKey << 8) | (uint8_t)key[i];
+    }
+    uint64_t *roundKey = GenerateRoundKeys(streamKey); // *uint64_t OR uint64_t[16]
 
-    InitialPermutation(inputBlock, blockNum);                         // +++ uint64_t 블록을 처리하기 위해 blockNum을 매개변수로 사용 (sizeof, strlen 등 사용불가) +++
-    uint64_t *result = FeistelRounds(inputBlock, roundKey, blockNum); // Feistel 함수, Feistel.cpp에서 정의되어 있다고 가정
-    FinalPermutation(result, blockNum);                               // 최종 순열 적용
+    InitialPermutation(inputBlock, blockNum);                          // +++ uint64_t 블록을 처리하기 위해 blockNum을 매개변수로 사용 (sizeof, strlen 등 사용불가) +++
+    uint64_t *Feistel = FeistelRounds(inputBlock, roundKey, blockNum); // Feistel 함수, Feistel.cpp에서 정의되어 있다고 가정
+    FinalPermutation(Feistel, blockNum);                               // 최종 순열 적용
+
+    const char *result = BlocksToString(Feistel, blockNum, blockNum * 8); // blockNum * 8 = 원래 문자열 길이(패딩 포함), 복호화 시 원래 길이 사용(len)
 
     delete[] inputBlock;
-    // delete[] roundKey;
+    delete[] roundKey;
+    delete[] Feistel;
 
     return result; // encrytion된 문자가 사용이 끝나면, 호출한 곳에서 result를 처리(반환)해야함
 }
 
-uint64_t *StringTo64BitBlocks(const char *Data, int &blockNum)
+const char *DES_Decryption(const char *cipher, const char *key, DesContext &context)
 {
-    int len = strlen(Data);   // 문자열 길이
+    int blockNum = context.blockNum;
+    int len = context.len;
+
+    // 암호문 -> uint64_t 블록 배열로 변환
+    uint64_t *blocks = new uint64_t[blockNum];
+    for (int i = 0; i < blockNum; ++i)
+    {
+        uint64_t block = 0;
+        for (int j = 0; j < 8; ++j)
+        {
+            block = (block << 8) | (uint8_t)cipher[i * 8 + j];
+        }
+        blocks[i] = block;
+    }
+
+    uint64_t streamKey = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        streamKey = (streamKey << 8) | (uint8_t)key[i];
+    }
+
+    // 라운드 키 생성 및 역순 배열
+    uint64_t *roundKey = GenerateRoundKeys(streamKey);
+    uint64_t reversedKey[16];
+    for (int i = 0; i < 16; ++i)
+    {
+        reversedKey[i] = roundKey[15 - i];
+    }
+
+    // 복호화 수행
+    InitialPermutation(blocks, blockNum);
+    uint64_t *Feistel = FeistelRounds(blocks, reversedKey, blockNum);
+    FinalPermutation(Feistel, blockNum);
+
+    // 결과 문자열로 변환 (패딩 제거 포함)
+    const char *result = BlocksToString(Feistel, blockNum, len);
+
+    // 메모리 해제
+    delete[] blocks;
+    delete[] roundKey;
+    delete[] Feistel;
+
+    return result; // 호출자가 delete[] 해줘야 함
+}
+
+uint64_t *StringToBlocks(const char *input, int &blockNum, int &len)
+{
+    len = strlen(input);      // 문자열 길이
     blockNum = (len + 7) / 8; // 나머지를 보정하기 위한 + 7
 
     uint64_t *blocks = new uint64_t[blockNum];
@@ -41,8 +92,8 @@ uint64_t *StringTo64BitBlocks(const char *Data, int &blockNum)
         for (int j = 0; j < 8; ++j)
         {
             int index = i * 8 + j;
-            uint8_t byte = (index < len) ? Data[index] : 0x00; // 문자열 길이를 초과하면 0으로 채움(패딩)
-            block_temp = (block_temp << 8) | byte;             // 왼쪽으로 시프트하고 바이트를 추가, big endian 방식
+            uint8_t byte = (index < len) ? input[index] : 0x00; // 문자열 길이를 초과하면 0으로 채움(패딩)
+            block_temp = (block_temp << 8) | byte;              // 왼쪽으로 시프트하고 바이트를 추가, big endian 방식
         }
         blocks[i] = block_temp; // 64bit x i 블록에 저장
     }
@@ -50,36 +101,19 @@ uint64_t *StringTo64BitBlocks(const char *Data, int &blockNum)
     return blocks; // 64비트 블록 배열 반환
 }
 
-const char *DES_Decryption(uint64_t *encryptedBlocks, int blockNum)
+const char *BlocksToString(uint64_t *blocks, int blockNum, int len)
 {
-    uint64_t reverseKey[16];
-    for (int i = 0; i < 16; ++i)
-        reverseKey[i] = roundKey[15 - i]; // 역순으로 키를 저장
+    char *result = new char[len + 1];
 
-    InitialPermutation(encryptedBlocks, blockNum);                                     // 초기 순열 적용
-    uint64_t *decryptionBlocks = FeistelRounds(encryptedBlocks, reverseKey, blockNum); // 역순으로 라운드 키를 사용하여 Feistel 함수 적용
-    FinalPermutation(decryptionBlocks, blockNum);                                      // 최종 순열 적용
-
-    const char *result = BlocksToString(decryptionBlocks, blockNum);
-
-    delete[] encryptedBlocks;
-    delete[] roundKey;
-
-    return result; // 복호화된 결과 반환, 사용이 끝나면 호출한 곳에서 result를 처리(반환)해야함
-}
-
-const char *BlocksToString(uint64_t *Data, int blockNum)
-{
-    char *result = new char[blockNum * 8 + 1];
-
-    for (int i = 0; i < blockNum; ++i)
+    int origin = 0;
+    for (int i = 0; i < blockNum && origin < len; ++i)
     {
-        for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 8 && origin < len; ++j)
         {
-            result[i * 8 + (7 - j)] = (Data[i] >> (j * 8)) & 0xFF; // big endian 방식으로 변환?
+            result[origin++] = (blocks[i] >> (8 * (7 - j))) & 0xFF;
         }
     }
 
-    result[blockNum * 8] = '\0'; // 문자열 끝에 널 문자 추가
+    result[len] = '\0'; // 문자열 끝에 널 문자 추가
     return result;
 }
