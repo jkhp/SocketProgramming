@@ -1,5 +1,13 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
+#include <iostream>
+
+#include "InitialPermutation.h"
+#include "FeistelRound.h"
+#include "FinalPermutation.h"
+#include "KeySchedule.h"
+
 #define BUFSIZE 512
 
 // context -> 복호화를 위한 구조체, 직렬화 후 server을 통해 전달
@@ -13,5 +21,5 @@ typedef struct
 const char *DES_Encryption(const char *input, const char *key, DesContext &context);
 const char *DES_Decryption(const char *chiper, const char *key, DesContext &context);
 
-uint64_t *StringToBlocks(const char *input, int &blockNum);
-const char *BlocksToString(uint64_t *blocks, int &blockNum);
+uint64_t *StringToBlocks(const char *input, int &blockNum, int &len);
+const char *BlocksToString(uint64_t *blocks, int blockNum, int len);

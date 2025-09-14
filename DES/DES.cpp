@@ -1,11 +1,4 @@
-#include <cstring>
-#include <cstdint>
-
 #include "DES.h"
-#include "InitialPermutation.h"
-#include "FeistelRound.h"
-#include "FinalPermutation.h"
-#include "KeySchedule.h"
 
 const char *DES_Encryption(const char *input, const char *key, DesContext &context)
 {
@@ -71,7 +64,6 @@ const char *DES_Decryption(const char *cipher, const char *key, DesContext &cont
     // 결과 문자열로 변환 (패딩 제거 포함)
     const char *result = BlocksToString(Feistel, blockNum, len);
 
-    // 메모리 해제
     delete[] blocks;
     delete[] roundKey;
     delete[] Feistel;
