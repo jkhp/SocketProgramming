@@ -10,12 +10,10 @@
 typedef struct
 {
     int len;
-    int blcokNum;
+    int blockNum;
     char data[MAX_SIZE];
 } Packet;
 #pragma pack(pop) // 원래 패딩 설정으로 복원
 
-void BuildPacket(Packet &packet, const uint8_t *data, uint16_t len);
-uint16_t ReturnLength(const Packet &packet);
 void SendPacket(int sock, const Packet &packet);
-void ReceivePacket(int sock);
+int ReceivePacket(int sock, Packet &packet);
