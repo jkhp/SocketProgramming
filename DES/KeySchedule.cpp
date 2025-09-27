@@ -1,4 +1,4 @@
-#include "keyschedule.h"
+#include "KeySchedule.h"
 
 uint64_t *GenerateRoundKeys(uint64_t streamKey)
 {

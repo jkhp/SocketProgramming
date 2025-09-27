@@ -1,8 +1,8 @@
 #include "DES.h"
 
-void DES_Encrtption(Packet &packet, const char *key)
+void DES_Encryption(Packet &packet, const char *key)
 {
-    uint64_t *inputBlock = StringToBlocks(packet.data, packet.blcokNum, packet.len); // packet에 blockNum, len 저장
+    uint64_t *inputBlock = StringToBlocks(packet.data, packet.blockNum, packet.len); // packet에 blockNum, len 저장
 
     uint64_t streamKey = 0;
     for (int i = 0; i < 8; ++i)
@@ -11,14 +11,14 @@ void DES_Encrtption(Packet &packet, const char *key)
     }
     uint64_t *roundKey = GenerateRoundKeys(streamKey); // *uint64_t OR uint64_t[16]
 
-    InitialPermutation(inputBlock, packet.blcokNum);                          // +++ uint64_t 블록을 처리하기 위해 blockNum을 매개변수로 사용 (sizeof, strlen 등 사용불가) +++
-    uint64_t *Feistel = FeistelRounds(inputBlock, roundKey, packet.blcokNum); // Feistel 함수, Feistel.cpp에서 정의되어 있다고 가정
-    FinalPermutation(Feistel, packet.blcokNum);                               // 최종 순열
+    InitialPermutation(inputBlock, packet.blockNum);                          // +++ uint64_t 블록을 처리하기 위해 blockNum을 매개변수로 사용 (sizeof, strlen 등 사용불가) +++
+    uint64_t *Feistel = FeistelRounds(inputBlock, roundKey, packet.blockNum); // Feistel 함수, Feistel.cpp에서 정의되어 있다고 가정
+    FinalPermutation(Feistel, packet.blockNum);                               // 최종 순열
 
-    const char *result = BlocksToString(Feistel, packet.blcokNum, packet.blcokNum * 8); // blockNum * 8 = 원래 문자열 길이(패딩 포함), 복호화 시 원래 길이 사용(len)
+    const char *result = BlocksToString(Feistel, packet.blockNum, packet.blockNum * 8); // blockNum * 8 = 원래 문자열 길이(패딩 포함), 복호화 시 원래 길이 사용(len)
 
     memset(packet.data, 0, BUFSIZE);
-    memcpy(packet.data, result, packet.blcokNum * 8);
+    memcpy(packet.data, result, packet.blockNum * 8);
 
     delete[] inputBlock;
     delete[] roundKey;
@@ -28,8 +28,7 @@ void DES_Encrtption(Packet &packet, const char *key)
 
 uint64_t *StringToBlocks(const char *input, int &blockNum, int &len)
 {
-    len = strlen(input);      // 문자열 길이
-    blockNum = (len + 7) / 8; // 나머지를 보정하기 위한 + 7
+    blockNum = (len + 7) / 8; // 나머지를 보정하기 위한 + 7, len은 client에서 설정
 
     uint64_t *blocks = new uint64_t[blockNum];
 
@@ -51,8 +50,8 @@ uint64_t *StringToBlocks(const char *input, int &blockNum, int &len)
 void DES_Decryption(Packet &packet, const char *key)
 {
     // 암호문 -> uint64_t 블록 배열로 변환
-    uint64_t *blocks = new uint64_t[packet.blcokNum];
-    for (int i = 0; i < packet.blcokNum; ++i)
+    uint64_t *blocks = new uint64_t[packet.blockNum];
+    for (int i = 0; i < packet.blockNum; ++i)
     {
         uint64_t block = 0;
         for (int j = 0; j < 8; ++j)
@@ -77,12 +76,12 @@ void DES_Decryption(Packet &packet, const char *key)
     }
 
     // 복호화 수행
-    InitialPermutation(blocks, packet.blcokNum);
-    uint64_t *Feistel = FeistelRounds(blocks, reversedKey, packet.blcokNum);
-    FinalPermutation(Feistel, packet.blcokNum);
+    InitialPermutation(blocks, packet.blockNum);
+    uint64_t *Feistel = FeistelRounds(blocks, reversedKey, packet.blockNum);
+    FinalPermutation(Feistel, packet.blockNum);
 
     // 결과 문자열로 변환
-    const char *result = BlocksToString(Feistel, packet.blcokNum, packet.len);
+    const char *result = BlocksToString(Feistel, packet.blockNum, packet.len);
 
     memset(packet.data, 0, BUFSIZE);
     memcpy(packet.data, result, packet.len);
