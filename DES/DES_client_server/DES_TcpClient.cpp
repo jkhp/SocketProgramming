@@ -144,6 +144,12 @@ void *RecvThread(void *arg)
             running = 0;
             break; // 루프 탈출
         }
+
+        char key[9];
+        keyLoop(key); // 8바이트 키 입력 루프
+
+        DES_Decryption(packet, key);
+        printf("복호화된 데이터: %s\n", packet.data);
     }
 
     return NULL;

@@ -3,7 +3,7 @@
 // c->s, s->c 공통
 void SendPacket(int sock, Packet &packet)
 {
-    int len = packet.blockNum * 8; // 암호문을 전송
+    int len = packet.blockNum * 8; // 암호문을 전송하기 위한 길이(바이트)
 
     packet.len = htons((uint16_t)packet.len);           // 네트워크 바이트 오더로 변환
     packet.blockNum = htons((uint16_t)packet.blockNum); // data는 DES에서 직렬화해서 넣어줌(memcpy)

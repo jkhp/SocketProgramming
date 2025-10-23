@@ -4,7 +4,7 @@
 
 # ✅ 전체 체크리스트
 
-## 🔹 [A] 네트워크 기능 구현 (기본 완료됨)
+## 🔹 [A] 네트워크 기능 구현
 
 - [x] TCP/UDP 멀티 프로토콜 서버 구현
 - [x] IPv4/IPv6 듀얼 스택 처리
@@ -21,7 +21,7 @@
 - [x] 이벤트 처리 `--nready`, break/continue 오류 정리
 - [x] Windows 호환 코드로 이식 및 검증
 
-## 🔹 [C] 보안 기능 도입 (**진행 예정**)
+## 🔹 [C] 보안 기능 도입
 
 - [x] DES 구현 (서버가 키를 가지지 않는 단순 E2EE 구조)
   - [x] encryption 구현
@@ -36,39 +36,22 @@
 
 ## 🔹 [D] 개발 유틸리티 & 자동화
 
-- [ ] `Makefile` 작성 (Linux 빌드 자동화)
-- [ ] `Shell Script` 또는 `bash` 사용한 실행 자동화
+- [x] `Shell Script` 또는 `bash` 사용한 실행 자동화
+- [x] `Makefile` 작성 (Linux 빌드 자동화)
 
 ## 🔹 [E] 객체지향 구조 도입 및 멀티스레딩
 
-- [ ] 간단한 **멀티스레딩 실험 및 구조 설계**
-- [ ] `SocketManager` 클래스화
-- [ ] `TcpClient`, `UdpClient` 추상화
-- [ ] 메시지 구조 클래스 설계 (`Message`, `User`, `Session` 등)
-- [ ] 이벤트 핸들러 클래스로 분리
+- [x] 간단한 **멀티스레딩 실험 및 구조 설계**
+- [ ] Client → Server → Client (c-s-c) 구조 구현
+- [ ] 비동기 I/O 모델 실험 (IOCP, io_uring 등)
 
 ## 🔹 [G] 추가 검토할 기능
 
-- [ ] **비동기 I/O 모델 실험 (IOCP, io_uring 등)**
+- [x] **스레드 동기화 및 race condition 대응 (mutex, condition, atomic 등)**
+- [ ] **DB 연결** (채팅내용, 사용자 정보, 기록 등)
 - [ ] **채팅 ID 도입** (송/수신자 구분)
 - [ ] **1:N 메시지 전송**
 - [ ] **N:N 채팅방 구성**
-- [ ] **멀티스레딩 구조 완성 (thread pool, 작업 큐 기반 등)**
-- [ ] **스레드 동기화 및 race condition 대응 (mutex, condition, atomic 등)**
-- [ ] **TCP 연결 종료 상태 대응 (TIME_WAIT, CLOSE_WAIT 등)**
-- [ ] **네트워크 예외 이벤트 대응 (RST, SIGPIPE, linger 등)**
 - [ ] **프로토콜 계층화 및 메세지 라우팅 구조화**
-- [ ] **다중 클라이언트 부하 테스트 및 성능 병목 측정**
 
 - [ ] **파일 전송 기능** (sendfile, chunk, 파일 이름 포함 구조 등)
-- [ ] **디버깅 모드 추가** (로그 레벨 구분, 콘솔 출력 제어)
-- [ ] **클라이언트 채팅 기록 복원 기능**
-- [ ] **소켓 옵션 설정 (keep-alive, reuseaddr 등)**
-- [ ] **메시지 전송 방식 개선**
-  - [ ] 고정 길이
-  - [ ] 가변 길이
-  - [ ] 길이 + 메시지 조합
-  - [ ] **Client → Server → Client (c-s-c) 구조 구현**
-  - [ ] ID 기반 메시지 중계
-  - [ ] 메시지 필터링 (방, 대상 ID 등)
-  - [ ] 향후 1:N / N:N 확장 기반 확보

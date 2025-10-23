@@ -1,5 +1,8 @@
 {
   "files.associations": {
-    "cstdint": "cpp"
+    "cstdint": "cpp",
+    "atomic": "cpp",
+    "memory": "cpp",
+    "utility": "cpp"
   }
 }

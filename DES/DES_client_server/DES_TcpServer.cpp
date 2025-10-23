@@ -6,6 +6,13 @@
 #define BUFSIZE 1024
 volatile int running = 1;
 
+typedef struct
+{
+    char ipAddr[INET_ADDRSTRLEN];
+    uint16_t port;
+    int display = NULL; // client에게 보여줄 번호, 매 작동마다 새롭게 부여 및 초기화
+} acceptClientInfo;
+
 void SocketBindAndListen(SOCKET &listen_sock);
 void keyLoop(char *key);
 
@@ -37,8 +44,10 @@ int main(int argc, char *argv[])
         }
 
         char addr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &clientaddr.sin_addr, addr, sizeof(addr));
-        printf("\n[TCP 서버] 클라이언트 접속 : IP 주소 = %s, 포트 번호 = %d\n", addr, ntohs(clientaddr.sin_port));
+        uint16_t port = ntohs(clientaddr.sin_port);                   // client port 번호
+        inet_ntop(AF_INET, &clientaddr.sin_addr, addr, sizeof(addr)); // client IP 주소
+
+        printf("\n[TCP 서버] 클라이언트 접속 : IP 주소 = %s, 포트 번호 = %d\n", addr, port);
 
         while (1)
         {
