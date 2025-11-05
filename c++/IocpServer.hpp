@@ -1,16 +1,20 @@
 #pragma once
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "mswsock.lib")
 
 #include "Common.hpp"
 #include <vector>
+#include <array>
 #include <thread>
 #include <atomic>
+#define BUFSIZE 1024
 
 struct SOCKETINFO
 {
     OVERLAPPED overlapped; // 비동기 입출력 작업의 상태 정보를 저장하는 구조체
     WSABUF wsabuf;         // Windows 소켓 버퍼 구조체(길이, 포인터), WSASend 및 WSARecv 함수에서 사용, IOCP에서 각 클라이언트 송수신 버퍼 관리
     SOCKET sock;
-    std::vector<char> buffer;
+    std::array<char, BUFSIZE> buffer;
     int recvBytes;
     int sendBytes;
 };
@@ -20,7 +24,7 @@ class IocpServer
 public:
     explicit IocpServer(int af, uint16_t port) // 암시적 변환 x, main에서 af, port 전달받음
         : af(af), port(port), listen_sock(INVALID_SOCKET), running(false) {};
-    ~IocpServer();
+    ~IocpServer() = default;
 
     void Start();
     void Stop();

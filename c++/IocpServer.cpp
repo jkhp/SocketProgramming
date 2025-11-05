@@ -1,8 +1,5 @@
 #include "IocpServer.hpp"
 #include <iostream>
-#include <array>
-
-#define BUFSIZE 1024
 
 void IocpServer::Start()
 {
@@ -128,7 +125,7 @@ void IocpServer::BindAndListen()
     if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR)
         err_quit("listen()");
 
-    std::cout << "[TCP 서버] 포트번호: " << port << ", " << (af == AF_INET ? "IPv4" : "IPv6") << " 시작" << std::endl;
+    std::cout << "[TCP SERVER] PORT: " << port << ", " << (af == AF_INET ? "IPv4" : "IPv6") << " START" << std::endl;
 }
 
 SOCKET IocpServer::AcceptClient(sockaddr_storage &caddr, socklen_t &clen)
@@ -141,7 +138,7 @@ SOCKET IocpServer::AcceptClient(sockaddr_storage &caddr, socklen_t &clen)
 
 void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen)
 {
-    std::array<char, NI_MAXHOST> hostIP{}; // [check] 나중에 String으로 변환, ClientInfo 구조체에 저장할 수도 있음(Map, vector 등)
+    std::array<char, NI_MAXHOST> hostIP{}; // [check] 나중에 String에 값을 복사 후, ClientInfo 구조체에 저장할 수도 있음(Map, vector 등)
     std::array<char, NI_MAXSERV> hostPort{};
 
     int retval = getnameinfo((sockaddr *)&caddr, clen,
@@ -153,13 +150,20 @@ void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen)
         std::cerr << "getnameinfo() 오류: " << gai_strerrorA(retval) << std::endl;
         return;
     }
-    std::cout << "[IOCP 클라이언트 접속] IP 주소: " << hostIP.data() << ", 포트 번호: " << hostPort.data() << std::endl;
+    std::cout << "[클라이언트 접속] IP 주소: " << hostIP.data() << ", 포트 번호: " << hostPort.data() << std::endl
+              << std::endl;
 }
 
 void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, socklen_t clen)
 {
     // 소켓과 입출력 완료 포트 연결
-    CreateIoCompletionPort((HANDLE)client_sock, iocpHandle, (ULONG_PTR)client_sock, 0);
+    HANDLE h = CreateIoCompletionPort((HANDLE)client_sock, iocpHandle, (ULONG_PTR)client_sock, 0);
+    if (h == nullptr)
+    {
+        err_display("CreateIoCompletionPort()");
+        closesocket(client_sock);
+        return;
+    }
 
     // 소켓 정보 구조체 할당
     SOCKETINFO *sockInfo = new SOCKETINFO();
@@ -219,7 +223,7 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
         SOCKETINFO *ptr = reinterpret_cast<SOCKETINFO *>(lpOv); // OVERLAPPED가 첫 멤버여야 안전
 
         // 원격 종료 또는 실패, 정상 io 완료지만 전송된 바이트 수가 0인 경우도 포함
-        if (!ok || cbTransferred == 0)
+        if (!ok)
         {
             std::cout << "[클라이언트 종료] 소켓: " << ptr->sock << std::endl;
             closesocket(ptr->sock);
@@ -230,14 +234,16 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
         // 주소 출력 [Check]
         sockaddr_storage ss{};
         int slen = sizeof(ss);
+        char hostIP[NI_MAXHOST]{}, hostPort[NI_MAXSERV]{};
         if (getpeername(ptr->sock, reinterpret_cast<sockaddr *>(&ss), &slen) == 0)
         {
-            char hostIP[NI_MAXHOST]{}, hostPort[NI_MAXSERV]{};
-            if (getnameinfo(reinterpret_cast<sockaddr *>(&ss), slen,
-                            hostIP, NI_MAXHOST, hostPort, NI_MAXSERV,
-                            NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+            int nameinfoResult = getnameinfo(reinterpret_cast<sockaddr *>(&ss), slen,
+                                             hostIP, NI_MAXHOST, hostPort, NI_MAXSERV,
+                                             NI_NUMERICHOST | NI_NUMERICSERV);
+            if (nameinfoResult != 0)
             {
-                printf("[WorkerThread] 클라이언트 주소: %s, 포트: %s\n", hostIP, hostPort);
+                std::cerr << "getnameinfo() 오류: " << gai_strerrorA(nameinfoResult) << std::endl;
+                continue;
             }
         }
 
@@ -251,8 +257,8 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             if (ptr->recvBytes < ptr->buffer.size())
                 ptr->buffer[ptr->recvBytes] = '\0';
 
-            // 간단 에코 출력 (주소는 위에서 출력)
-            printf("[TCP] %s\n", ptr->buffer.data());
+            // 서버에서 출력, wsarecv()에서 받은 데이터
+            printf("[WorkerThread] 클라이언트 주소: %s, 포트: %s\n수신 데이터: %s\n", hostIP, hostPort, ptr->buffer.data());
         }
         else
         {
