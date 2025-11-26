@@ -1,10 +1,10 @@
 #pragma once
 #include "AES_HMAC.hpp"
 
-#include <openssl/evp.h>  // EVP_Encrypt*/Decrypt*, PBKDF2 등, EVP_MAX_BLOCK_LENGTH = 32
-#include <openssl/rand.h> // RAND_bytes()
-#include <openssl/hmac.h> // HMAC_* (또는 OpenSSL 3.x의 EVP_MAC 대체 가능)
-#include <openssl/sha.h>  // SHA256 (직접 쓸 일은 적지만 종종 포함)
+#include <openssl/evp.h>        // EVP_Encrypt*/Decrypt*, PBKDF2, EVP_MAC(HMAC), EVP_KDF 등, EVP_MAX_BLOCK_LENGTH = 32
+#include <openssl/rand.h>       // RAND_bytes()
+#include <openssl/params.h>     // openssl 3.x 이상의 핵심, 모든 알고리즘은 파라미터 기반으로 초기화됨, 파라미터 생성/설정/조회 함수 제공
+#include <openssl/core_names.h> // 3.x 이상, 파라미터 이름 문자열 상수 모음
 
 #include <cstring> // std::memcpy
 #include <stdexcept>
@@ -13,11 +13,10 @@ void EtmCipher::DeriveKeys(const std::string &password, const unsigned char *sal
                            int iterations, unsigned char enc_key[AES_KEY_LEN], unsigned char mac_key[AES_KEY_LEN])
 {
     unsigned char tmp[AES_KEY_LEN * 2]; // 32*2, 256bit
-    if (PKCS5_PBKDF2_HMAC(password.c_str(), (int)password.size(),
-                          salt, salt_len,
-                          iterations, EVP_sha256(),
-                          sizeof(tmp), tmp) != 1) // 성공:1 실패: 0
-        throw std::runtime_error("PBKDF2 failed");
+    if (PKCS5_PBKDF2_HMAC(password.c_str(), (int)password.size(), salt, salt_len,
+                          iterations, EVP_sha256(), sizeof(tmp), tmp) != 1) // 성공:1 실패: 0
+        throw std::runtime_error("PBKDF2 failed");                          // throw: 함수 즉시 종료(오류 발생 or 실패시 즉시), 실패시 성능 비용 or 멀티스레드 등 환경문제 고려 필요, 예외 전파(exception propagation) ->
+    // catch를 찾을 때까지 '스택을 타고 올라감'(메모리 누수 x) & 현재 catch가 없으므로 std::terminate() 호출 후 비정상 종료 처리
 
     std::memcpy(enc_key, tmp, AES_KEY_LEN);               // 앞 32byte
     std::memcpy(mac_key, tmp + AES_KEY_LEN, AES_KEY_LEN); // 뒤 32byte
@@ -114,20 +113,67 @@ std::vector<unsigned char> EtmCipher::Decrypt(const std::vector<unsigned char> &
     return plaintext;
 }
 
-void EtmCipher::HmacSha256(const unsigned char *key, size_t key_len, const std::vector<unsigned char> &salt, const std::vector<unsigned char> &iv,
-                           const std::vector<unsigned char> &ciphertext, unsigned char out_tag[TAG_LEN])
+void EtmCipher::HmacSha256(const unsigned char *key, size_t key_len,
+                           const std::vector<unsigned char> &salt,
+                           const std::vector<unsigned char> &iv,
+                           const std::vector<unsigned char> &ciphertext,
+                           unsigned char out_tag[TAG_LEN]) // TAG_LEN = 32
 {
-    unsigned int len = 0; // HMAC_Final()에서 길이 반환용
-    HMAC_CTX *hctx = HMAC_CTX_new();
-    if (!hctx)
-        throw std::runtime_error("HMAC_CTX_new failed");
+    // 1. "HMAC" 알고리즘 객체 가져오기
+    // OpenSSL 3.x에서는 EVP_MAC_fetch를 사용, 플러그인처럼 알고리즘을 동적으로 가져옴(provider에게 fetch)
+    EVP_MAC *mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+    if (!mac)
+        throw std::runtime_error("EVP_MAC_fetch(HMAC) 실패");
 
-    HMAC_Init_ex(hctx, key, (int)key_len, EVP_sha256(), nullptr);
-    HMAC_Update(hctx, salt.data(), salt.size());
-    HMAC_Update(hctx, iv.data(), iv.size());
-    HMAC_Update(hctx, ciphertext.data(), ciphertext.size());
-    HMAC_Final(hctx, out_tag, &len);
-    HMAC_CTX_free(hctx);
-    if (len != TAG_LEN)
-        throw std::runtime_error("HMAC length mismatch");
+    // 2. MAC 컨텍스트 생성
+    EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
+    if (!mctx)
+    {
+        EVP_MAC_free(mac);
+        throw std::runtime_error("EVP_MAC_CTX_new 실패");
+    }
+
+    size_t out_len = 0; // 최종 MAC 바이트 수, goto err 사용을 위해 선언 위치 조정 (goto 아래에 선언하면 스코프 문제로 접근 불가)
+
+    // 3. 파라미터 정의 (digest = SHA256 지정)
+    // OSSL_MAC_PARAM_DIGEST = "digest", OpenSSL 전체에 걸친 공통 파라미터 구조
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string( // utf8_string 타입 파라미터 생성하는 함수
+        OSSL_MAC_PARAM_DIGEST,                    // digest, hash 알고리즘을 사용(설정)하기 위한 파라미터 키
+        const_cast<char *>("SHA256"),             // SHA256 사용, C 스타일 문자열이므로 const_cast 필요v(const char* -> char*)
+        0);                                       // NUL 문자열
+    params[1] = OSSL_PARAM_construct_end();       // 파라미터 배열 종료
+
+    // 4. 초기화 -> 키 + 파라미터 설정
+    if (EVP_MAC_init(mctx, key, key_len, params) != 1)
+    {
+        EVP_MAC_CTX_free(mctx);
+        EVP_MAC_free(mac);
+        throw std::runtime_error("EVP_MAC_init 실패");
+    }
+
+    // 5. MAC 업데이트 (입력 데이터 순차 투입)
+    //    [salt || iv || ciphertext]를 모두 MAC에 포함해야 IV/암호문 변조를 감지가능
+    if (!salt.empty() && EVP_MAC_update(mctx, salt.data(), salt.size()) != 1)
+        goto err;
+
+    if (!iv.empty() && EVP_MAC_update(mctx, iv.data(), iv.size()) != 1)
+        goto err;
+
+    if (!ciphertext.empty() && EVP_MAC_update(mctx, ciphertext.data(), ciphertext.size()) != 1)
+        goto err;
+
+    // 6. 최종 MAC 생성 (32바이트)
+    if (EVP_MAC_final(mctx, out_tag, &out_len, TAG_LEN) != 1 || out_len != TAG_LEN)
+        goto err;
+
+    // 7. 정상 종료 후 정리
+    EVP_MAC_CTX_free(mctx);
+    EVP_MAC_free(mac);
+    return;
+
+err: // openssl/goto 모두 c 스타일, 예외발생 전 정리(free)가 필요하므로
+    EVP_MAC_CTX_free(mctx);
+    EVP_MAC_free(mac);
+    throw std::runtime_error("EVP_MAC update/final 실패");
 }

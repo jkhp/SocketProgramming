@@ -2,7 +2,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
-#include "Common.hpp"
+#include "../Common.hpp"
 #include <vector>
 #include <array>
 #include <thread>

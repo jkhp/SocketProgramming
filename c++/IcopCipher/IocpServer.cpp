@@ -1,4 +1,5 @@
 #include "IocpServer.hpp"
+#include "AES_HMAC.hpp"
 #include <iostream>
 
 void IocpServer::Start()
@@ -69,7 +70,7 @@ void IocpServer::Run()
         if (client_sock == INVALID_SOCKET)
             continue;
 
-        PrintClientInfo(caddr, clen);
+        PrintClientInfo(caddr, clen); // 여기서 소켓 리스트를 출력 및 선택
         IocpStart(client_sock, caddr, clen);
     }
 
@@ -152,6 +153,8 @@ void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen)
     }
     std::cout << "[클라이언트 접속] IP 주소: " << hostIP.data() << ", 포트 번호: " << hostPort.data() << std::endl
               << std::endl;
+
+    // clientinfo 구조체를 선언해서 관리, client에게 clientinfo 리스트를 보내주고 선택하게 함,
 }
 
 void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, socklen_t clen)
@@ -164,6 +167,9 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
         closesocket(client_sock);
         return;
     }
+
+    // 여기서 clientinfo 정보를 송신(wsasend())? 송신하려면 구조체 할당 작업이 필요하므로 코드 위치를 아래로 이동?
+    // 워커 스레드에서 항상 [id | data] 형태로 받기?
 
     // 소켓 정보 구조체 할당
     SOCKETINFO *sockInfo = new SOCKETINFO();
@@ -197,7 +203,7 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
 
     while (IsRunning())
     {
-        DWORD cbTransferred = 0;
+        DWORD cbTransferred = 0; // 완료된 io 바이트 수
         ULONG_PTR completionKey = 0;
         LPOVERLAPPED lpOv = nullptr;
 
@@ -230,6 +236,13 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             delete ptr;
             continue;
         }
+        if (cbTransferred == 0) // client 정상 종료
+        {
+            std::cout << "[클라이언트 정상 종료] 소켓: " << ptr->sock << std::endl;
+            closesocket(ptr->sock);
+            delete ptr;
+            continue;
+        }
 
         // 주소 출력 [Check]
         sockaddr_storage ss{};
@@ -249,16 +262,35 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
 
         // 수신/송신 진행도 업데이트
         if (ptr->recvBytes == 0)
-        { // 이번 완료는 '수신'으로 간주 (최초 post가 WSARecv였기 때문)
+        { // 이번 완료는 '수신'으로 간주 (최초 post가 WSARecv였기 때문), 모두 받은 상황?
             ptr->recvBytes = cbTransferred;
             ptr->sendBytes = 0;
 
-            // 마지막 널문자 추가
-            if (ptr->recvBytes < ptr->buffer.size())
-                ptr->buffer[ptr->recvBytes] = '\0';
+            std::vector<unsigned char> cipher(
+                ptr->buffer.begin(),
+                ptr->buffer.begin() + ptr->recvBytes);
 
-            // 서버에서 출력, wsarecv()에서 받은 데이터
-            printf("[WorkerThread] 클라이언트 주소: %s, 포트: %s\n수신 데이터: %s\n", hostIP, hostPort, ptr->buffer.data());
+            printf("[WorkerThread] 클라이언트 주소: %s, 포트: %s\n 암호문: ", hostIP, hostPort);
+            fwrite(ptr->buffer.data(), 1, ptr->recvBytes, stdout); // 수신된 암호문 출력
+            printf("\n");
+
+            std::vector<unsigned char> plain;
+            try
+            {
+                plain = EtmCipher::Decrypt(cipher, "password", 200000);
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "Decrypt 실패: " << e.what() << std::endl;
+                closesocket(ptr->sock);
+                delete ptr;
+                continue;
+            }
+
+            printf("복호문: ");
+            fwrite(plain.data(), 1, plain.size(), stdout);
+            printf("\n\n");
+            // 선택받은 client에게 전달 송신(WSASend), [id | data] 형태로 송신, client에서 [andy] data 형태로 보내도록 하기
         }
         else
         {
