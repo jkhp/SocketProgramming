@@ -8,7 +8,13 @@ void IocpServer::Start()
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
         err_quit("WSAStartup()");
 
+    iocpHandle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+    if (iocpHandle == nullptr)
+        err_quit("CreateIoCompletionPort()");
+
     running = true;
+
+    taskThread_.Start();
     main_thread = std::thread(&IocpServer::Run, this);
 }
 
@@ -22,10 +28,18 @@ void IocpServer::Stop()
             listen_sock = INVALID_SOCKET;
         }
 
+        sessionRegistry.ForEach([](const std::shared_ptr<Session> &s)
+                                {if (s) s->Close(); }); // 세션이 남아있다면 모두 종료
+
+        static constexpr ULONG_PTR exitKey = 0xDEAD;
+
         // 대기 중인 워커를 깨우기 위해 웨이크업 패킷 전송, 그렇지 않으면 GetQueuedCompletionStatus에서 영원히 대기
-        for (size_t i = 0; i < worker_threads.size(); ++i)
+        if (iocpHandle)
         {
-            PostQueuedCompletionStatus(iocpHandle, 0, 0, nullptr); // 모든 워커 스레드에 nullptr 전달, 스레드 내부에서 종료 처리, [check]
+            for (size_t i = 0; i < worker_threads.size(); ++i)
+            {
+                PostQueuedCompletionStatus(iocpHandle, 0, exitKey, nullptr); // 모든 워커 스레드에 nullptr 전달, 스레드 내부에서 종료 처리, [check]
+            }
         }
 
         if (main_thread.joinable())
@@ -37,6 +51,8 @@ void IocpServer::Stop()
                 t.join();
         }
 
+        worker_threads.clear();
+
         // Run() IOCP 핸들 정리
         if (iocpHandle)
         {
@@ -44,16 +60,14 @@ void IocpServer::Stop()
             iocpHandle = nullptr;
         }
 
+        taskThread_.Stop();
+
         WSACleanup();
     }
 }
 
 void IocpServer::Run()
 {
-    iocpHandle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0); // IOCP 핸들 생성
-    if (iocpHandle == nullptr)
-        err_quit("CreateIoCompletionPort()");
-
     MakeWorkerThread();
 
     InitSocket();
@@ -168,8 +182,7 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
         return;
     }
 
-    // 여기서 clientinfo 정보를 송신(wsasend())? 송신하려면 구조체 할당 작업이 필요하므로 코드 위치를 아래로 이동?
-    // 워커 스레드에서 항상 [id | data] 형태로 받기?
+    std::shared_ptr<Session> session = sessionRegistry.Add(client_sock, caddr, static_cast<int>(clen));
 
     // 소켓 정보 구조체 할당
     SOCKETINFO *sockInfo = new SOCKETINFO();
@@ -181,6 +194,8 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
     sockInfo->sendBytes = 0;
     sockInfo->wsabuf.len = BUFSIZE;
     sockInfo->wsabuf.buf = sockInfo->buffer.data();
+
+    sockInfo->sessionId = session->sessionId; // 세션 id 설정
 
     // 비동기 수신 시작
     DWORD flags = 0;
@@ -200,8 +215,10 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
 DWORD WINAPI IocpServer::WorkerThread(void *arg)
 {
     HANDLE iocpHandle = static_cast<HANDLE>(arg);
+    static constexpr ULONG_PTR exitKey = 0xDEAD;
 
-    while (IsRunning())
+    // 종료 중에도 completion packet이 남아있을 수 있으므로, Stop()에서 Session 종료(소켓 닫기) 후 break
+    while (true)
     {
         DWORD cbTransferred = 0; // 완료된 io 바이트 수
         ULONG_PTR completionKey = 0;
@@ -214,32 +231,30 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             &lpOv,
             INFINITE);
 
-        if (lpOv == nullptr) // stop()에서 running=false로 바꾸고 깨우기 용도로 PostQueuedCompletionStatus 호출 시, [check]
-        {
-            if (!IsRunning())
-            {
-                break; // 종료 지시 → 루프 종료
-            }
-            else
-            {
-                continue; // 그냥 깨우기 용도였다면 무시
-            }
-        }
+        if (lpOv == nullptr && completionKey == exitKey)
+            break;
+
+        // 스푸리어스/깨움 용도(현재는 사용 안 해도 안전하게 처리)
+        if (lpOv == nullptr)
+            continue;
 
         SOCKETINFO *ptr = reinterpret_cast<SOCKETINFO *>(lpOv); // OVERLAPPED가 첫 멤버여야 안전
 
-        // 원격 종료 또는 실패, 정상 io 완료지만 전송된 바이트 수가 0인 경우도 포함
-        if (!ok)
+        std::shared_ptr<Session> session = sessionRegistry.Find(ptr->sessionId);
+
+        // shutdown/에러/원격종료/세션 미존재 => 자원 정리로 수렴
+        if (!ok || cbTransferred == 0 || !session || !session->IsAlive())
         {
-            std::cout << "[클라이언트 종료] 소켓: " << ptr->sock << std::endl;
+            if (session)
+            {
+                // (중복 Close는 Session 내부에서 방어한다고 가정)
+                session->Close();
+                sessionRegistry.Remove(ptr->sessionId);
+            }
+
+            // 현재 코드 구조상 기존과 동일하게 closesocket을 유지
             closesocket(ptr->sock);
-            delete ptr;
-            continue;
-        }
-        if (cbTransferred == 0) // client 정상 종료
-        {
-            std::cout << "[클라이언트 정상 종료] 소켓: " << ptr->sock << std::endl;
-            closesocket(ptr->sock);
+
             delete ptr;
             continue;
         }
@@ -266,6 +281,15 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             ptr->recvBytes = cbTransferred;
             ptr->sendBytes = 0;
 
+            // task 생성 후 taskqueue에 push
+            Task task;
+            task.type = TaskType::RecvMessage;
+            task.sessionId = ptr->sessionId;
+            task.data.assign(ptr->buffer.begin(), ptr->buffer.begin() + ptr->recvBytes);
+
+            taskQueue_.Push(std::move(task));
+
+            /*
             std::vector<unsigned char> cipher(
                 ptr->buffer.begin(),
                 ptr->buffer.begin() + ptr->recvBytes);
@@ -291,6 +315,7 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             fwrite(plain.data(), 1, plain.size(), stdout);
             printf("\n\n");
             // 선택받은 client에게 전달 송신(WSASend), [id | data] 형태로 송신, client에서 [andy] data 형태로 보내도록 하기
+            */
         }
         else
         {

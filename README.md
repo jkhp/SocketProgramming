@@ -42,8 +42,8 @@
 ## 🔹 [E] 객체지향 구조 도입 및 멀티스레딩
 
 - [x] 간단한 **멀티스레딩 실험 및 구조 설계**
+- [x] 비동기 I/O 모델 실험 (IOCP, io_uring 등)
 - [ ] Client → Server → Client (c-s-c) 구조 구현
-- [ ] 비동기 I/O 모델 실험 (IOCP, io_uring 등)
 
 ## 🔹 [G] 추가 검토할 기능
 

@@ -3,6 +3,8 @@
 #pragma comment(lib, "mswsock.lib")
 
 #include "../Common.hpp"
+#include "Session.hpp"
+#include "Task.hpp"
 #include <vector>
 #include <array>
 #include <thread>
@@ -17,13 +19,15 @@ struct SOCKETINFO
     std::array<char, BUFSIZE> buffer;
     int recvBytes;
     int sendBytes;
+
+    std::uint64_t sessionId; // 세션 식별자
 };
 
 class IocpServer
 {
 public:
     explicit IocpServer(int af, uint16_t port) // 암시적 변환 x, main에서 af, port 전달받음
-        : af(af), port(port), listen_sock(INVALID_SOCKET), running(false) {};
+        : af(af), port(port), listen_sock(INVALID_SOCKET), iocpHandle(nullptr), running(false) {};
     ~IocpServer() = default;
 
     void Start();
@@ -53,4 +57,9 @@ private:
     std::thread main_thread; // accept & iocp thread
     std::vector<std::thread> worker_threads;
     std::atomic<bool> running; // volatile -> atomic, 멀티스레드 환경에서 변수(공유자원)의 일관성을 보장하기 위해 사용(원자성 보장)
+
+    SessionRegistry sessionRegistry; // 세션 관리 객체
+
+    TaskQueue taskQueue_;
+    TaskThread taskThread_{sessionRegistry, taskQueue_};
 };
