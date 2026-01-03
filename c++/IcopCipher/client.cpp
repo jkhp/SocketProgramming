@@ -1,24 +1,26 @@
 #include "../Common.hpp"
 #include "AES_HMAC.hpp"
-#include <iostream>
-#include <vector>
-#include <string>
 
-char *SERVERIP = (char *)"127.0.0.1";
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
+static const char *SERVERIP = "127.0.0.1";
 #define SERVERPORT 9000
 #define BUFSIZE 1024
 
 int main(int argc, char *argv[])
 {
-
-    int retval; // int형 소켓 함수의 결과를 받는 변수
-
-    // 명령행 인수가 있으면 ip 주소로 사용
-    if (argc > 1)
-        SERVERIP = argv[1]; // [0]은 프로그램 실행 명령, 1부터 입력받는 자료
+    int retval;
 
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    retval = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (retval != 0)
     {
         err_quit("WSAStartup()");
         return 1;
@@ -28,18 +30,27 @@ int main(int argc, char *argv[])
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET)
     {
-        err_quit("socket()"); // 실패시 INVAILD_SOCKET은 -1을 반환
+        err_quit("socket()");
         WSACleanup();
         return 1;
     }
 
     // connect()
-    struct sockaddr_in serveraddr;
-    memset(&serveraddr, 0, sizeof(serveraddr));
+    sockaddr_in serveraddr;
+    std::memset(&serveraddr, 0, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
-    inet_pton(AF_INET, SERVERIP, &serveraddr.sin_addr);
     serveraddr.sin_port = htons(SERVERPORT);
-    retval = connect(sock, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
+
+    retval = inet_pton(AF_INET, SERVERIP, &serveraddr.sin_addr);
+    if (retval != 1)
+    {
+        err_quit("inet_pton()");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    retval = connect(sock, reinterpret_cast<sockaddr *>(&serveraddr), sizeof(serveraddr));
     if (retval == SOCKET_ERROR)
     {
         err_quit("connect()");
@@ -49,97 +60,197 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "TCP 서버 연결 성공" << std::endl;
-    std::cout << "전송은 메세지 입력 후 Enter, 종료는 빈 줄 혹은 exit 후 Enter" << std::endl;
+    std::cout << "commands list | To <SessionId> | exit" << std::endl;
+
+    std::atomic<bool> running{true};
+    std::thread recvThread(ReceiverLoop, sock, std::ref(running));
 
     std::string input;
-
-    while (1)
+    while (running.load())
     {
         std::cout << "-> ";
-
         if (!std::getline(std::cin, input))
             break;
-        if (input.empty() || input == "exit")
+
+        if (input == "exit" || input.empty())
             break;
 
-        std::vector<unsigned char> plaintext(input.begin(), input.end());
-        std::vector<unsigned char> cipher;
+        if (input == "list")
+        {
+            auto pakcet = BuildPacket(
+                0, // from
+                0, // to
+                MsgType::ListReq,
+                nullptr,
+                0);
 
-        try
-        {
-            cipher = EtmCipher::Encrypt(plaintext, "password", 200000);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Encrypt 실패" << e.what() << std::endl;
+            if (!SendAll(sock, pakcet.data(), pakcet.size()))
+            {
+                err_display("Send(list)");
+                break;
+            }
             continue;
         }
 
-        std::cout << "[암호문] ";
-        fwrite(cipher.data(), 1, cipher.size(), stdout);
-        std::cout << std::endl;
-
-        size_t total_sent = 0;
-        while (total_sent < cipher.size())
+        if (input.rfind("To ", 0) == 0)
         {
-            int sent = send(sock, reinterpret_cast<const char *>(cipher.data() + total_sent),
-                            static_cast<int>(cipher.size() - total_sent), 0);
-
-            if (sent == SOCKET_ERROR)
-            {
-                std::cerr << "send() 실패" << WSAGetLastError() << "\n";
-                closesocket(sock);
-                WSACleanup();
-                return 1;
-            }
-            total_sent += sent;
-
-            // echo 암호문 수신
-            unsigned char recvBuf[4096];
-            int recvLen = recv(sock, reinterpret_cast<char *>(recvBuf),
-                               sizeof(recvBuf), 0);
-
-            if (recvLen == SOCKET_ERROR)
-            {
-                std::cerr << "recv() 실패 " << WSAGetLastError() << "\n";
-                closesocket(sock);
-                WSACleanup();
-                return 1;
-            }
-            if (recvLen == 0)
-            {
-                std::cout << "서버 연결 종료\n";
-                closesocket(sock);
-                WSACleanup();
-                return 0;
-            }
-
-            std::vector<unsigned char> cipherEcho(recvBuf, recvBuf + recvLen);
-
-            std::cout << "[echo 복호화 전] ";
-            std::fwrite(cipherEcho.data(), 1, cipherEcho.size(), stdout);
-            std::printf("\n");
-
-            // 복호화
-            std::vector<unsigned char> plainEcho;
+            std::uint32_t toSid = 0;
             try
             {
-                plainEcho = EtmCipher::Decrypt(cipherEcho, "password", 200000);
+                std::string sidStr = input.substr(3);
+                if (sidStr.empty())
+                    throw std::invalid_argument("empty");
+
+                toSid = static_cast<std::uint32_t>(std::stoul(sidStr));
+            }
+            catch (...)
+            {
+                std::cout << "형식 오류: To <SessionId>\n";
+                continue;
+            }
+
+            std::cout << "(msg)> ";
+            std::string msg;
+            if (!std::getline(std::cin, msg))
+                break;
+
+            std::vector<char> enc;
+            try
+            {
+                enc = EncryptChatPayload(msg);
             }
             catch (const std::exception &e)
             {
-                std::cerr << "Decrypt 실패: " << e.what() << "\n";
-                closesocket(sock);
-                WSACleanup();
-                return 1;
+                std::cerr << "[Encrypt 실패] " << e.what() << "\n";
+                continue;
             }
 
-            std::string textResult(plainEcho.begin(), plainEcho.end());
-            std::cout << "[echo 복호화 후] "
-                      << textResult << "\n\n";
+            std::vector pakcet = BuildPacket(
+                0,     // from
+                toSid, // to
+                MsgType::Chat,
+                enc.empty() ? nullptr : enc.data(),
+                enc.size());
+
+            if (!SendAll(sock, pakcet.data(), pakcet.size()))
+            {
+                err_display("send(chat)");
+                break;
+            }
+            continue;
         }
+
+        std::cout
+            << "다시 입력해주세요.\n"
+            << "commands:\n"
+            << "  list\n"
+            << "  To <SessionId>\n"
+            << "  exit\n";
     }
+
+    running.store(false);
+    shutdown(sock, SD_BOTH);
     closesocket(sock);
+
+    if (recvThread.joinable())
+        recvThread.join();
+
     WSACleanup();
     return 0;
+}
+
+static bool SendAll(SOCKET s, const char *buf, std::size_t len)
+{
+    std::size_t sent = 0;
+    while (sent < len)
+    {
+        int r = send(s, buf + sent, static_cast<int>(len - sent), 0);
+        if (r <= 0)
+            return false;
+        sent += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+static std::vector<char> EncryptChatPayload(const std::string &plain)
+{
+    const std::string password = "password";
+    const int iterations = 200000;
+
+    std::vector<unsigned char> in(plain.begin(), plain.end());
+    std::vector<unsigned char> enc = EtmCipher::Encrypt(in, password, iterations);
+    return std::vector<char>(enc.begin(), enc.end());
+}
+
+static std::string DecryptChatPayload(const std::vector<char> &cipher)
+{
+    const std::string password = "password";
+    const int iterations = 200000;
+
+    std::vector<unsigned char> in(cipher.begin(), cipher.end());
+    std::vector<unsigned char> dec = EtmCipher::Decrypt(in, password, iterations);
+    return std::string(dec.begin(), dec.end());
+}
+
+static void ReceiverLoop(SOCKET sock, std::atomic<bool> &running)
+{
+    std::vector<char> stream;
+    stream.reserve(2048);
+
+    char buf[BUFSIZE];
+
+    while (running.load())
+    {
+        int r = recv(sock, buf, static_cast<int>(sizeof(buf)), 0);
+        if (r <= 0)
+            break;
+
+        stream.insert(stream.end(), buf, buf + r);
+
+        while (stream.size() >= PacketHeaderSize)
+        {
+            PacketHeader header{};
+            std::memcpy(&header, stream.data(), PacketHeaderSize);
+
+            const std::uint32_t payloadLen = ntohl(header.payloadLen);
+            const MsgType type = static_cast<MsgType>(ntohs(header.type));
+            const std::uint32_t fromSid = ntohl(header.from);
+            // const std::uint32_t toSid     = ntohl(header.to);
+
+            if (stream.size() < PacketHeaderSize + payloadLen)
+                break;
+
+            std::vector<char> payload(
+                stream.begin() + PacketHeaderSize,
+                stream.begin() + PacketHeaderSize + payloadLen);
+
+            stream.erase(stream.begin(),
+                         stream.begin() + PacketHeaderSize + payloadLen);
+
+            if (fromSid == 0)
+            {
+                std::string msg(payload.begin(), payload.end());
+                std::cout << msg << "\n";
+            }
+            else if (type == MsgType::Chat)
+            {
+                try
+                {
+                    std::string plain = DecryptChatPayload(payload);
+                    std::cout << "[FROM " << fromSid << "] " << plain << "\n";
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[Decrypt 실패] " << e.what() << "\n";
+                }
+            }
+            else
+            {
+                std::string msg(payload.begin(), payload.end());
+                std::cout << msg << "\n";
+            }
+        }
+    }
+
+    running.store(false);
 }

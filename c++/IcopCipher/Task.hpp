@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cstdint> // std::uint64_t
+#include <cstdint> // std::uint32_t
 #include <vector>
 #include <queue>
 #include <mutex>
@@ -20,7 +20,10 @@ enum class TaskType
 struct Task
 {
     TaskType type{};
-    std::uint64_t sessionId{};
+    std::uint32_t fromSid{};
+    std::uint32_t toSid{};
+    MsgType msgType{MsgType::Chat};
+    std::uint16_t reserved{0};
     std::vector<char> data;
 };
 
@@ -129,27 +132,116 @@ private:
 
     void HandleRecvMessage(const Task &task)
     {
-        std::shared_ptr<Session> session = registry_.Find(task.sessionId);
-        if (!session || !session->IsAlive())
-        {
+        std::shared_ptr<Session> from = registry_.Find(task.fromSid);
+        if (!from || !from->IsAlive())
             return;
+
+        switch (task.msgType)
+        {
+        case MsgType::ListReq:
+        {
+            std::string list;
+
+            list += "=== Sessions ===\n";
+
+            registry_.ForEach([&](const std::shared_ptr<Session> &s)
+                              {
+            if (!s) return;
+            if (!s->IsAlive()) return;
+
+            if (s->sessionId == task.fromSid) return;   // 본인은 제외
+
+            list += std::to_string(s->sessionId);
+            list += '\n'; });
+
+            // task.msgType은 ListReq이므로 복사본에서 바꿔서 전송
+            Task replyTask = task;
+            replyTask.msgType = MsgType::ListResp;
+
+            SendServerError(task.fromSid, replyTask, list);
+            break;
         }
+        case MsgType::Chat:
+        {
+            std::shared_ptr<Session> target = registry_.Find(task.toSid);
+            if (!target || !target->IsAlive())
+            {
+                SendServerError(task.fromSid, task, "유효하지 않은 SessionId: " + std::to_string(task.toSid));
+                return;
+            }
 
-        std::cout << "[TaskThread] RecvMessage, sid = " << task.sessionId << ",size = " << task.data.size() << std::endl;
+            std::string msg(task.data.begin(), task.data.end());
 
-        // AES_HMAC, DB, 수신 작업, Task를 workerThead에 다시 전달 등
+            // 대상에게 전달
+            if (msg.empty() || msg.back() != '\n')
+                msg.push_back('\n');
+            SendPacketToSession(task.toSid, task.fromSid, task, msg);
+
+            std::cout << "[TaskThread] Routed FROM " << task.fromSid << " -> TO " << task.toSid
+                      << " (" << msg.size() << " bytes)\n";
+
+            break;
+        }
+        default:
+        {
+            SendServerError(task.fromSid, task, "유효하지 않은 작업");
+
+            break;
+        }
+        }
     }
 
     void HandleDisconnect(const Task &task)
     {
-        std::shared_ptr<Session> session = registry_.Find(task.sessionId);
+        std::shared_ptr<Session> session = registry_.Find(task.fromSid);
         if (!session)
             return;
 
         session->Close();
-        registry_.Remove(task.sessionId);
+        registry_.Remove(task.fromSid);
 
-        std::cout << "[TaskThread] Disconnect sid=" << task.sessionId << std::endl;
+        std::cout << "[TaskThread] Disconnect sid=" << task.fromSid << std::endl;
+    }
+
+    void SendPacketToSession(std::uint32_t targetSid, std::uint32_t requestSid, const Task &task, const std::string &msg)
+    {
+        std::shared_ptr<Session> s = registry_.Find(targetSid);
+        if (!s || !s->IsAlive())
+            return;
+
+        // Send용 IoContext는 완료까지 살아야 하므로 heap 생성
+        IoContext *ctx = new IoContext();
+        if (!ctx)
+            return;
+
+        ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+        ctx->type = IoType::Send;
+        ctx->sock = s->sock;
+        ctx->sessionId = targetSid;
+
+        std::vector<char> packet = BuildPacket(targetSid, requestSid, task.msgType, msg.data(), msg.size()); // header | payload
+        ctx->sendBuf = std::make_shared<std::vector<char>>(std::move(packet));
+        ctx->sendOffset = 0;
+
+        ctx->wsabuf.buf = reinterpret_cast<char *>(ctx->sendBuf->data());
+        ctx->wsabuf.len = static_cast<ULONG>(ctx->sendBuf->size());
+
+        int r = WSASend(ctx->sock, &ctx->wsabuf, 1, nullptr, 0, &ctx->overlapped, nullptr);
+        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+        {
+            err_display("WSASend()");
+            delete ctx;
+            return;
+        }
+    }
+
+    void SendServerError(std::uint32_t targetSid, const Task &task, const std::string &errMsg)
+    {
+        std::string out = errMsg + "\n";
+        if (out.empty() || out.back() != '\n')
+            out.push_back('\n');
+
+        SendPacketToSession(targetSid, 0, task, out);
     }
 
 private:

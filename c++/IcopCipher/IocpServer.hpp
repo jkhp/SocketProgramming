@@ -9,19 +9,6 @@
 #include <array>
 #include <thread>
 #include <atomic>
-#define BUFSIZE 1024
-
-struct SOCKETINFO
-{
-    OVERLAPPED overlapped; // 비동기 입출력 작업의 상태 정보를 저장하는 구조체
-    WSABUF wsabuf;         // Windows 소켓 버퍼 구조체(길이, 포인터), WSASend 및 WSARecv 함수에서 사용, IOCP에서 각 클라이언트 송수신 버퍼 관리
-    SOCKET sock;
-    std::array<char, BUFSIZE> buffer;
-    int recvBytes;
-    int sendBytes;
-
-    std::uint64_t sessionId; // 세션 식별자
-};
 
 class IocpServer
 {

@@ -184,31 +184,64 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
 
     std::shared_ptr<Session> session = sessionRegistry.Add(client_sock, caddr, static_cast<int>(clen));
 
-    // 소켓 정보 구조체 할당
-    SOCKETINFO *sockInfo = new SOCKETINFO();
-    if (sockInfo == nullptr)
+    IoContext *ctx = new IoContext();
+    if (ctx == nullptr)
         return;
-    ZeroMemory(&sockInfo->overlapped, sizeof(OVERLAPPED)); // [check]
-    sockInfo->sock = client_sock;
-    sockInfo->recvBytes = 0;
-    sockInfo->sendBytes = 0;
-    sockInfo->wsabuf.len = BUFSIZE;
-    sockInfo->wsabuf.buf = sockInfo->buffer.data();
 
-    sockInfo->sessionId = session->sessionId; // 세션 id 설정
+    ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+    ctx->type = IoType::Recv;
+    ctx->sock = client_sock;
+    ctx->sessionId = session->sessionId;
+
+    ctx->wsabuf.buf = ctx->recvBuf.data();
+    ctx->wsabuf.len = BUFSIZE;
 
     // 비동기 수신 시작
     DWORD flags = 0;
-    int retval = WSARecv(client_sock, &sockInfo->wsabuf, 1, nullptr, &flags, &sockInfo->overlapped, nullptr); // [check] 누적 recv 처리
-    if (retval == SOCKET_ERROR)
+    int retval = WSARecv(client_sock, &ctx->wsabuf, 1, nullptr, &flags, &ctx->overlapped, nullptr);
+    if (retval == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
     {
-        if (WSAGetLastError() != WSA_IO_PENDING)
-        {
-            err_display("WSARecv()");
-            closesocket(client_sock);
-            delete sockInfo;
-            return;
-        }
+        err_display("WSARecv()");
+        session->Close();                           // 소켓 닫기
+        sessionRegistry.Remove(session->sessionId); // map에서 shared_ptr 제거
+        delete ctx;                                 // IoContext 메모리 해제
+        return;
+    }
+
+    // 접속 메시지 + Sesison 목록 전송 (서버 -> 클라이언트)
+    std::string out;
+    out += "[SERVER] Connected. 나의 SessionId = " + std::to_string(session->sessionId) + "\n";
+    out += "[SERVER] 접속 중인 Sessions:\n";
+
+    sessionRegistry.ForEach([&out](const std::shared_ptr<Session> &s)
+                            {
+        if (s && s->IsAlive())
+            out += " - " + std::to_string(s->sessionId) + "\n"; });
+
+    out += "[SERVER] 아래 형식으로 입력해주세요. \n";
+    out += "To <SessionId> (Enter) \n";
+    out += "<message> (Enter) \n";
+
+    IoContext *sctx = new IoContext();
+    if (!sctx)
+        return;
+
+    ZeroMemory(&sctx->overlapped, sizeof(OVERLAPPED));
+    sctx->type = IoType::Send;
+    sctx->sock = client_sock;
+    sctx->sessionId = session->sessionId;
+
+    sctx->sendBuf = std::make_shared<std::vector<char>>(out.begin(), out.end());
+    sctx->sendOffset = 0;
+
+    sctx->wsabuf.buf = reinterpret_cast<char *>(sctx->sendBuf->data());
+    sctx->wsabuf.len = static_cast<ULONG>(sctx->sendBuf->size());
+
+    int sr = WSASend(client_sock, &sctx->wsabuf, 1, nullptr, 0, &sctx->overlapped, nullptr);
+    if (sr == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+    {
+        err_display("WSASend()");
+        delete sctx; // Session은 유지
     }
 }
 
@@ -217,7 +250,7 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
     HANDLE iocpHandle = static_cast<HANDLE>(arg);
     static constexpr ULONG_PTR exitKey = 0xDEAD;
 
-    // 종료 중에도 completion packet이 남아있을 수 있으므로, Stop()에서 Session 종료(소켓 닫기) 후 break
+    // 종료 중에도 completion packet이 남아있을 수 있으므로, Stop()에서 Session 종료(소켓 닫기) 후 while 탈출(break)
     while (true)
     {
         DWORD cbTransferred = 0; // 완료된 io 바이트 수
@@ -238,9 +271,9 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
         if (lpOv == nullptr)
             continue;
 
-        SOCKETINFO *ptr = reinterpret_cast<SOCKETINFO *>(lpOv); // OVERLAPPED가 첫 멤버여야 안전
+        IoContext *ctx = reinterpret_cast<IoContext *>(lpOv);
 
-        std::shared_ptr<Session> session = sessionRegistry.Find(ptr->sessionId);
+        std::shared_ptr<Session> session = sessionRegistry.Find(ctx->sessionId);
 
         // shutdown/에러/원격종료/세션 미존재 => 자원 정리로 수렴
         if (!ok || cbTransferred == 0 || !session || !session->IsAlive())
@@ -249,110 +282,106 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             {
                 // (중복 Close는 Session 내부에서 방어한다고 가정)
                 session->Close();
-                sessionRegistry.Remove(ptr->sessionId);
+                sessionRegistry.Remove(ctx->sessionId);
             }
 
-            // 현재 코드 구조상 기존과 동일하게 closesocket을 유지
-            closesocket(ptr->sock);
-
-            delete ptr;
+            delete ctx;
             continue;
         }
 
-        // 주소 출력 [Check]
-        sockaddr_storage ss{};
-        int slen = sizeof(ss);
-        char hostIP[NI_MAXHOST]{}, hostPort[NI_MAXSERV]{};
-        if (getpeername(ptr->sock, reinterpret_cast<sockaddr *>(&ss), &slen) == 0)
+        switch (ctx->type)
         {
-            int nameinfoResult = getnameinfo(reinterpret_cast<sockaddr *>(&ss), slen,
-                                             hostIP, NI_MAXHOST, hostPort, NI_MAXSERV,
-                                             NI_NUMERICHOST | NI_NUMERICSERV);
-            if (nameinfoResult != 0)
+        case IoType::Recv:
+        {
+            // TCP stream 누적 + (header|payload) 파싱
+            ctx->streamBuf.insert(ctx->streamBuf.end(),
+                                  ctx->recvBuf.begin(),
+                                  ctx->recvBuf.begin() + cbTransferred);
+
+            size_t consumed = 0;
+            while (true)
             {
-                std::cerr << "getnameinfo() 오류: " << gai_strerrorA(nameinfoResult) << std::endl;
-                continue;
-            }
-        }
+                const size_t available = ctx->streamBuf.size() - consumed;
+                if (available < PacketHeaderSize) // 헤더가 모두 올 때까지 대기
+                    break;
 
-        // 수신/송신 진행도 업데이트
-        if (ptr->recvBytes == 0)
-        { // 이번 완료는 '수신'으로 간주 (최초 post가 WSARecv였기 때문), 모두 받은 상황?
-            ptr->recvBytes = cbTransferred;
-            ptr->sendBytes = 0;
+                PacketHeader header{};
+                std::memcpy(&header, ctx->streamBuf.data() + consumed, PacketHeaderSize);
 
-            // task 생성 후 taskqueue에 push
-            Task task;
-            task.type = TaskType::RecvMessage;
-            task.sessionId = ptr->sessionId;
-            task.data.assign(ptr->buffer.begin(), ptr->buffer.begin() + ptr->recvBytes);
+                const std::uint32_t payloadLen = ntohl(header.payloadLen);
+                const std::uint32_t toSid = ntohl(header.to);
+                const std::uint32_t fromSid = ntohl(header.from);
+                const MsgType msgType = static_cast<MsgType>(ntohs(header.type));
+                const std::uint16_t reserved = ntohs(header.reserved);
 
-            taskQueue_.Push(std::move(task));
+                if (available < PacketHeaderSize + payloadLen)
+                    break; // payload가 아직 덜 옴
 
-            /*
-            std::vector<unsigned char> cipher(
-                ptr->buffer.begin(),
-                ptr->buffer.begin() + ptr->recvBytes);
+                // 패킷 1개 완성 -> Task 생성
+                Task task;
+                task.type = TaskType::RecvMessage;
+                task.fromSid = ctx->sessionId;
+                task.toSid = toSid;
+                task.msgType = msgType;
+                task.reserved = reserved;
 
-            printf("[WorkerThread] 클라이언트 주소: %s, 포트: %s\n 암호문: ", hostIP, hostPort);
-            fwrite(ptr->buffer.data(), 1, ptr->recvBytes, stdout); // 수신된 암호문 출력
-            printf("\n");
+                const char *payloadStart = ctx->streamBuf.data() + consumed + PacketHeaderSize;
+                task.data.assign(payloadStart, payloadStart + payloadLen);
 
-            std::vector<unsigned char> plain;
-            try
-            {
-                plain = EtmCipher::Decrypt(cipher, "password", 200000);
-            }
-            catch (const std::exception &e)
-            {
-                std::cerr << "Decrypt 실패: " << e.what() << std::endl;
-                closesocket(ptr->sock);
-                delete ptr;
-                continue;
+                taskQueue_.Push(std::move(task));
+
+                consumed += PacketHeaderSize + payloadLen;
             }
 
-            printf("복호문: ");
-            fwrite(plain.data(), 1, plain.size(), stdout);
-            printf("\n\n");
-            // 선택받은 client에게 전달 송신(WSASend), [id | data] 형태로 송신, client에서 [andy] data 형태로 보내도록 하기
-            */
-        }
-        else
-        {
-            ptr->sendBytes += cbTransferred; // 이번 완료는 '송신' 일부 완료, 누적
-        }
+            if (consumed > 0)
+                ctx->streamBuf.erase(ctx->streamBuf.begin(), ctx->streamBuf.begin() + consumed);
 
-        // 아직 보낼 게 남았으면 추가 송신
-        if (ptr->recvBytes > ptr->sendBytes)
-        {
-            ZeroMemory(&ptr->overlapped, sizeof(OVERLAPPED));
-            ptr->wsabuf.buf = ptr->buffer.data() + ptr->sendBytes;
-            ptr->wsabuf.len = ptr->recvBytes - ptr->sendBytes;
+            // 다음 수신 재개(Recv ctx 재사용)
+            ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+            ctx->wsabuf.buf = ctx->recvBuf.data();
+            ctx->wsabuf.len = BUFSIZE;
+
             DWORD flags = 0;
-            int r = WSASend(ptr->sock, &ptr->wsabuf, 1, nullptr, flags, &ptr->overlapped, nullptr); // [check] 후에 echo 외 다른 처리
-            if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
-            {
-                err_display("WSASend()");
-                closesocket(ptr->sock);
-                delete ptr;
-                continue;
-            }
-        }
-        else
-        { // 모두 보냄 → 다음 수신 재개
-            ptr->recvBytes = 0;
-            ZeroMemory(&ptr->overlapped, sizeof(OVERLAPPED));
-            ptr->wsabuf.buf = ptr->buffer.data();
-            ptr->wsabuf.len = BUFSIZE;
-            DWORD flags = 0;
-            int r = WSARecv(ptr->sock, &ptr->wsabuf, 1, nullptr, &flags, &ptr->overlapped, nullptr);
+            int r = WSARecv(ctx->sock, &ctx->wsabuf, 1, nullptr, &flags, &ctx->overlapped, nullptr);
             if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
             {
                 err_display("WSARecv()");
-                closesocket(ptr->sock);
-                delete ptr;
-                continue;
+                session->Close();
+                sessionRegistry.Remove(ctx->sessionId);
+                delete ctx;
             }
+            break;
+        }
+
+        case IoType::Send:
+        {
+            // 부분 송신 처리
+            ctx->sendOffset += cbTransferred;
+
+            if (ctx->sendBuf && ctx->sendOffset < ctx->sendBuf->size())
+            {
+                ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+
+                ctx->wsabuf.buf = reinterpret_cast<char *>(ctx->sendBuf->data() + ctx->sendOffset);
+                ctx->wsabuf.len = static_cast<ULONG>(ctx->sendBuf->size() - ctx->sendOffset);
+
+                int r = WSASend(ctx->sock, &ctx->wsabuf, 1, nullptr, 0, &ctx->overlapped, nullptr);
+                if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
+                {
+                    err_display("WSASend()");
+                    delete ctx; // send ctx만 정리
+                }
+                break;
+            }
+
+            // send 완료
+            delete ctx;
+            break;
+        }
+
+        default:
+            delete ctx;
+            break;
         }
     }
     return 0;

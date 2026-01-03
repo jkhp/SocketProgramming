@@ -2,15 +2,42 @@
 
 #include "../Common.hpp"
 #include <atomic>
-#include <cstdint> // std::uint64_t
+#include <cstdint> // std::uint32_t
 #include <cstring> // std::memcpy
 #include <unordered_map>
 #include <memory> // std::shared_ptr, std::enable_shared_from_this
 #include <mutex>
+#include <array>
+#include <vector>
+
+#define BUFSIZE 1024
+
+enum class IoType : uint8_t
+{
+    Recv,
+    Send
+};
+
+struct IoContext
+{
+    OVERLAPPED overlapped{};
+    IoType type{IoType::Recv};
+
+    SOCKET sock{INVALID_SOCKET};
+    std::uint32_t sessionId{0};
+
+    WSABUF wsabuf{};
+    std::array<char, BUFSIZE> recvBuf{};
+
+    std::shared_ptr<std::vector<char>> sendBuf;
+    size_t sendOffset{0}; // 부분 송신 시 사용
+
+    std::vector<char> streamBuf; // tcp stream 누적 버퍼
+};
 
 struct Session : public std::enable_shared_from_this<Session> // 자기 자신을 다른 곳에 전달 할 때 shared_ptr로 안전하게 전달하기 위해 사용
 {
-    std::uint64_t sessionId{};
+    std::uint32_t sessionId{};
     SOCKET sock{INVALID_SOCKET};
 
     sockaddr_storage remoteAddr{};
@@ -18,7 +45,7 @@ struct Session : public std::enable_shared_from_this<Session> // 자기 자신�
 
     std::atomic<bool> alive{false};
 
-    Session(std::uint64_t sid, SOCKET s, const sockaddr_storage &addr, int addrLen)
+    Session(std::uint32_t sid, SOCKET s, const sockaddr_storage &addr, int addrLen)
         : sessionId(sid), sock(s), remoteAddrLen(addrLen), alive(true)
     {
         std::memcpy(&remoteAddr, &addr, static_cast<size_t>(addrLen)); // remoteaddr에 복사
@@ -57,22 +84,22 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_); // 기존 mutex 방식보다 안전함, 스코프를 벗어나면 자동으로 unlock
 
-        std::uint64_t sid = ++lastId_;
+        std::uint32_t sid = ++lastId_;
         std::shared_ptr<Session> session = std::make_shared<Session>(sid, sock, addr, addrLen);
         sessions_.emplace(sid, session);
         return session;
     }
 
-    std::shared_ptr<Session> Find(std::uint64_t sid)
+    std::shared_ptr<Session> Find(std::uint32_t sid)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::unordered_map<std::uint64_t, std::shared_ptr<Session>>::iterator it = sessions_.find(sid); // iterator -> 맵의 항목을 가르키는 포인터 역할
+        std::unordered_map<std::uint32_t, std::shared_ptr<Session>>::iterator it = sessions_.find(sid); // iterator -> 맵의 항목을 가르키는 포인터 역할
         if (it == sessions_.end())                                                                      // 못 찾음
             return nullptr;
         return it->second; // first: key, second: value(shared_ptr<Session>)
     }
 
-    void Remove(std::uint64_t sid)
+    void Remove(std::uint32_t sid)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         sessions_.erase(sid);
@@ -91,6 +118,6 @@ public:
 
 private:
     std::mutex mutex_;
-    std::unordered_map<std::uint64_t, std::shared_ptr<Session>> sessions_;
-    std::uint64_t lastId_{0};
+    std::unordered_map<std::uint32_t, std::shared_ptr<Session>> sessions_;
+    std::uint32_t lastId_{0};
 };

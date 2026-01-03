@@ -26,6 +26,47 @@ typedef int SOCKET;
 #include <cstring>
 #include <cstdint>
 #include <string>
+#include <vector>
+
+enum class MsgType : std::uint16_t
+{
+    Chat = 1,
+    ListReq = 2,
+    ListResp = 3,
+    Error = 4,
+};
+
+#pragma pack(push, 1)
+struct PacketHeader
+{
+    std::uint32_t payloadLen;
+    std::uint32_t to;
+    std::uint32_t from;
+    std::uint16_t type;
+    std::uint16_t reserved;
+};
+#pragma pack(pop)
+
+static constexpr std::size_t PacketHeaderSize = sizeof(PacketHeader);
+
+inline std::vector<char> BuildPacket(std::uint32_t toSid, std::uint32_t fromSid, MsgType type, const char *payload, std::size_t payloadLen, std::uint16_t reserved = 0)
+{
+    std::vector<char> out;
+    out.resize(PacketHeaderSize + payloadLen);
+
+    PacketHeader header{};
+    header.payloadLen = htonl(static_cast<std::uint32_t>(payloadLen));
+    header.to = htonl(toSid);
+    header.from = htonl(fromSid);
+    header.type = htons(static_cast<std::uint16_t>(type));
+    header.reserved = htons(reserved);
+
+    std::memcpy(out.data(), &header, PacketHeaderSize);
+    if (payloadLen > 0 && payload)
+        std::memcpy(out.data() + PacketHeaderSize, payload, payloadLen);
+
+    return out;
+}
 
 inline void err_quit(const char *msg)
 {
