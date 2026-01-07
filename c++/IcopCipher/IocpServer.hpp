@@ -28,7 +28,7 @@ protected:
     void MakeWorkerThread();
     void BindAndListen();
     SOCKET AcceptClient(sockaddr_storage &caddr, socklen_t &clen);
-    void PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen);
+    void PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen, bool type);
     void IocpStart(SOCKET client, const sockaddr_storage &caddr, socklen_t clen);
 
     DWORD WINAPI WorkerThread(void *arg); // void* == LPVOID, IocpStart에서 WSARecv()가 정상 호출된 후 WorkerThread에서 IOCP 작업 처리

@@ -154,6 +154,9 @@ private:
             list += std::to_string(s->sessionId);
             list += '\n'; });
 
+            if (list.data() == "=== Sessions ===\n")
+                list += "No Connected Sessions\n";
+
             // task.msgType은 ListReq이므로 복사본에서 바꿔서 전송
             Task replyTask = task;
             replyTask.msgType = MsgType::ListResp;
@@ -173,18 +176,16 @@ private:
             std::string msg(task.data.begin(), task.data.end());
 
             // 대상에게 전달
-            if (msg.empty() || msg.back() != '\n')
-                msg.push_back('\n');
             SendPacketToSession(task.toSid, task.fromSid, task, msg);
 
             std::cout << "[TaskThread] Routed FROM " << task.fromSid << " -> TO " << task.toSid
-                      << " (" << msg.size() << " bytes)\n";
+                      << " (" << msg.size() << " bytes)\n"; // block cipher이라 128bit 단위로 보냄
 
             break;
         }
         default:
         {
-            SendServerError(task.fromSid, task, "유효하지 않은 작업");
+            SendServerError(task.fromSid, task, "유효하지 않은 작업\n");
 
             break;
         }

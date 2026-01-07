@@ -84,7 +84,7 @@ void IocpServer::Run()
         if (client_sock == INVALID_SOCKET)
             continue;
 
-        PrintClientInfo(caddr, clen); // 여기서 소켓 리스트를 출력 및 선택
+        PrintClientInfo(caddr, clen, 0); // 여기서 소켓 리스트를 출력 및 선택
         IocpStart(client_sock, caddr, clen);
     }
 
@@ -151,24 +151,28 @@ SOCKET IocpServer::AcceptClient(sockaddr_storage &caddr, socklen_t &clen)
     return client_sock;
 }
 
-void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen)
+void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen, bool type)
 {
-    std::array<char, NI_MAXHOST> hostIP{}; // [check] 나중에 String에 값을 복사 후, ClientInfo 구조체에 저장할 수도 있음(Map, vector 등)
-    std::array<char, NI_MAXSERV> hostPort{};
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port = 0;
 
-    int retval = getnameinfo((sockaddr *)&caddr, clen,
-                             hostIP.data(), (DWORD)hostIP.size(),
-                             hostPort.data(), (DWORD)hostPort.size(),
-                             NI_NUMERICHOST | NI_NUMERICSERV);
-    if (retval != 0)
+    if (caddr.ss_family == AF_INET)
     {
-        std::cerr << "getnameinfo() 오류: " << gai_strerrorA(retval) << std::endl;
-        return;
+        sockaddr_in *addr = (sockaddr_in *)&caddr;
+        inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
+        port = ntohs(addr->sin_port);
     }
-    std::cout << "[클라이언트 접속] IP 주소: " << hostIP.data() << ", 포트 번호: " << hostPort.data() << std::endl
-              << std::endl;
+    else
+    {
+        sockaddr_in6 *addr = (sockaddr_in6 *)&caddr;
+        inet_ntop(AF_INET6, &addr->sin6_addr, ip, sizeof(ip));
+        port = ntohs(addr->sin6_port);
+    }
 
-    // clientinfo 구조체를 선언해서 관리, client에게 clientinfo 리스트를 보내주고 선택하게 함,
+    if (type == 0)
+        std::cout << "[클라이언트 접속] IP 주소: " << ip << ", 포트 번호: " << port << std::endl;
+    else
+        std::cout << "[클라이언트 종료] IP 주소: " << ip << ", 포트 번호: " << port << std::endl;
 }
 
 void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, socklen_t clen)
@@ -210,17 +214,7 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
 
     // 접속 메시지 + Sesison 목록 전송 (서버 -> 클라이언트)
     std::string out;
-    out += "[SERVER] Connected. 나의 SessionId = " + std::to_string(session->sessionId) + "\n";
-    out += "[SERVER] 접속 중인 Sessions:\n";
-
-    sessionRegistry.ForEach([&out](const std::shared_ptr<Session> &s)
-                            {
-        if (s && s->IsAlive())
-            out += " - " + std::to_string(s->sessionId) + "\n"; });
-
-    out += "[SERVER] 아래 형식으로 입력해주세요. \n";
-    out += "To <SessionId> (Enter) \n";
-    out += "<message> (Enter) \n";
+    out += "나의 SessionId = " + std::to_string(session->sessionId) + "\n";
 
     IoContext *sctx = new IoContext();
     if (!sctx)
@@ -231,7 +225,9 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
     sctx->sock = client_sock;
     sctx->sessionId = session->sessionId;
 
-    sctx->sendBuf = std::make_shared<std::vector<char>>(out.begin(), out.end());
+    std::vector<char> packet = BuildPacket(session->sessionId, 0, MsgType::ListResp, out.data(), out.size());
+
+    sctx->sendBuf = std::make_shared<std::vector<char>>(std::move(packet));
     sctx->sendOffset = 0;
 
     sctx->wsabuf.buf = reinterpret_cast<char *>(sctx->sendBuf->data());
@@ -280,7 +276,8 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
         {
             if (session)
             {
-                // (중복 Close는 Session 내부에서 방어한다고 가정)
+                // 종료 로그
+                PrintClientInfo(session->remoteAddr, session->remoteAddrLen, 1);
                 session->Close();
                 sessionRegistry.Remove(ctx->sessionId);
             }
