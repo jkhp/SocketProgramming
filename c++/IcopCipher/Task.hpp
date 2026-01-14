@@ -25,6 +25,28 @@ struct Task
     MsgType msgType{MsgType::Chat};
     std::uint16_t reserved{0};
     std::vector<char> data;
+
+    static Task MakeRecvMessage(std::uint32_t from, std::uint32_t to,
+                                MsgType mt, std::uint16_t res,
+                                std::vector<char> &&payload) // && : rvalue 참조, 우측값만 받음
+    {
+        Task task;
+        task.type = TaskType::RecvMessage;
+        task.fromSid = from;
+        task.toSid = to;
+        task.msgType = mt;
+        task.reserved = res;
+        task.data = std::move(payload); // 복사 없음
+        return task;
+    }
+
+    static Task MakeDisconnect(std::uint32_t sid)
+    {
+        Task task;
+        task.type = TaskType::Disconnect;
+        task.fromSid = sid;
+        return task;
+    }
 };
 
 class TaskQueue
@@ -154,8 +176,8 @@ private:
             list += std::to_string(s->sessionId);
             list += '\n'; });
 
-            if (list.data() == "=== Sessions ===\n")
-                list += "No Connected Sessions\n";
+            if (list == "=== Sessions ===\n")
+                list += "No other connected Sessions\n";
 
             // task.msgType은 ListReq이므로 복사본에서 바꿔서 전송
             Task replyTask = task;
@@ -198,7 +220,7 @@ private:
         if (!session)
             return;
 
-        session->Close();
+        (void)session->Close(); // void Close() -> bool Close()
         registry_.Remove(task.fromSid);
 
         std::cout << "[TaskThread] Disconnect sid=" << task.fromSid << std::endl;
@@ -210,22 +232,12 @@ private:
         if (!s || !s->IsAlive())
             return;
 
+        std::vector<char> packet = BuildPacket(targetSid, requestSid, task.msgType, msg.data(), msg.size()); // header | payload
         // Send용 IoContext는 완료까지 살아야 하므로 heap 생성
-        IoContext *ctx = new IoContext();
+
+        IoContext *ctx = IoContext::CreateSend(s->sock, targetSid, std::make_shared<std::vector<char>>(std::move(packet)));
         if (!ctx)
             return;
-
-        ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
-        ctx->type = IoType::Send;
-        ctx->sock = s->sock;
-        ctx->sessionId = targetSid;
-
-        std::vector<char> packet = BuildPacket(targetSid, requestSid, task.msgType, msg.data(), msg.size()); // header | payload
-        ctx->sendBuf = std::make_shared<std::vector<char>>(std::move(packet));
-        ctx->sendOffset = 0;
-
-        ctx->wsabuf.buf = reinterpret_cast<char *>(ctx->sendBuf->data());
-        ctx->wsabuf.len = static_cast<ULONG>(ctx->sendBuf->size());
 
         int r = WSASend(ctx->sock, &ctx->wsabuf, 1, nullptr, 0, &ctx->overlapped, nullptr);
         if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)

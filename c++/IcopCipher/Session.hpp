@@ -14,6 +14,7 @@
 
 enum class IoType : uint8_t
 {
+    Accept,
     Recv,
     Send
 };
@@ -29,10 +30,68 @@ struct IoContext
     WSABUF wsabuf{};
     std::array<char, BUFSIZE> recvBuf{};
 
+    std::array<char, (sizeof(sockaddr_storage) + 16) * 2> acceptBuf{}; // acceptex 버퍼
+
     std::shared_ptr<std::vector<char>> sendBuf;
     size_t sendOffset{0}; // 부분 송신 시 사용
 
     std::vector<char> streamBuf; // tcp stream 누적 버퍼
+
+    static IoContext *CreateRecv(SOCKET s, std::uint32_t sid)
+    {
+        IoContext *ctx = new IoContext();
+        if (!ctx)
+            return nullptr;
+
+        ::ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+        ctx->type = IoType::Recv;
+        ctx->sock = s;
+        ctx->sessionId = sid;
+
+        ctx->wsabuf.buf = ctx->recvBuf.data();
+        ctx->wsabuf.len = BUFSIZE;
+        return ctx;
+    }
+
+    static IoContext *CreateSend(SOCKET s, std::uint32_t sid, std::shared_ptr<std::vector<char>> buf, size_t offset = 0)
+    {
+        IoContext *ctx = new IoContext();
+        if (!ctx)
+            return nullptr;
+
+        ::ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+        ctx->type = IoType::Send;
+        ctx->sock = s;
+        ctx->sessionId = sid;
+
+        ctx->sendBuf = std::move(buf);
+        ctx->sendOffset = offset;
+
+        const size_t remain = (ctx->sendBuf && ctx->sendBuf->size() > ctx->sendOffset)
+                                  ? (ctx->sendBuf->size() - ctx->sendOffset)
+                                  : 0;
+
+        ctx->wsabuf.buf = (remain > 0) ? reinterpret_cast<char *>(ctx->sendBuf->data() + ctx->sendOffset) : nullptr;
+        ctx->wsabuf.len = static_cast<ULONG>(remain);
+        return ctx;
+    }
+
+    static IoContext *CreateAccept(int af)
+    {
+        IoContext *ctx = new IoContext();
+        if (!ctx)
+            return nullptr;
+
+        ::ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
+        ctx->type = IoType::Accept;
+        ctx->sock = ::WSASocket(af, SOCK_STREAM, 0, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (ctx->sock == INVALID_SOCKET)
+        {
+            delete ctx;
+            return nullptr;
+        }
+        return ctx;
+    }
 };
 
 struct Session : public std::enable_shared_from_this<Session> // 자기 자신을 다른 곳에 전달 할 때 shared_ptr로 안전하게 전달하기 위해 사용
@@ -53,20 +112,22 @@ struct Session : public std::enable_shared_from_this<Session> // 자기 자신�
 
     ~Session()
     {
-        Close(); // Session 소멸시 소켓 닫기
+        (void)Close(); // Session 소멸시 소켓 닫기
     }
 
-    void Close()
+    bool Close()
     {
         bool expected = true;
-        if (alive.compare_exchange_strong(expected, false)) // alive가 true(expected)일 때만 false로 변경, 성공한 경우 true 반환 후 아래 실행(소켓 닫기)
+        if (!alive.compare_exchange_strong(expected, false)) // compare_exchange_strong: alive와 expected의 값이 같으면 alive를 false로 변경하고 true 반환, 다르면 expected에 alive값을 복사하고 false 반환
+            return false;                                    // 이미 Close()를 호출한 상태
+
+        if (sock != INVALID_SOCKET)
         {
-            if (sock != INVALID_SOCKET)
-            {
-                ::closesocket(sock);
-                sock = INVALID_SOCKET;
-            }
+            ::shutdown(sock, SD_BOTH); //
+            ::closesocket(sock);
+            sock = INVALID_SOCKET;
         }
+        return true;
     }
 
     bool IsAlive() const noexcept // noexcept: 예외를 던지지 않음을 컴파일러에 알림

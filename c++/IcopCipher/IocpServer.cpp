@@ -15,7 +15,7 @@ void IocpServer::Start()
     running = true;
 
     taskThread_.Start();
-    main_thread = std::thread(&IocpServer::Run, this);
+    main_thread = std::thread(&IocpServer::Run, this); // main_thread 제거?
 }
 
 void IocpServer::Stop()
@@ -29,9 +29,7 @@ void IocpServer::Stop()
         }
 
         sessionRegistry.ForEach([](const std::shared_ptr<Session> &s)
-                                {if (s) s->Close(); }); // 세션이 남아있다면 모두 종료
-
-        static constexpr ULONG_PTR exitKey = 0xDEAD;
+                                { if (s) (void)s->Close(); }); // 세션이 남아있다면 모두 종료, Close()의 반환값 무시
 
         // 대기 중인 워커를 깨우기 위해 웨이크업 패킷 전송, 그렇지 않으면 GetQueuedCompletionStatus에서 영원히 대기
         if (iocpHandle)
@@ -73,26 +71,19 @@ void IocpServer::Run()
     InitSocket();
     BindAndListen();
 
-    while (IsRunning())
-    {
-        sockaddr_storage caddr{};
-        socklen_t clen{};
+    if (CreateIoCompletionPort((HANDLE)listen_sock, iocpHandle, listenKey, 0) == nullptr) // listen_sock을 IOCP에 연결
+        err_quit("CreateIoCompletionPort(listen_sock)");
 
-        clen = sizeof(caddr); // AcceptClient 호출 전 초기화
+    if (!LoadAcceptEx())
+        err_quit("LoadAcceptEx()");
 
-        SOCKET client_sock = AcceptClient(caddr, clen);
-        if (client_sock == INVALID_SOCKET)
-            continue;
+    SYSTEM_INFO sysInfo;     // 시스템 정보 구조체
+    GetSystemInfo(&sysInfo); // 시스템 정보 가져오기
 
-        PrintClientInfo(caddr, clen, 0); // 여기서 소켓 리스트를 출력 및 선택
-        IocpStart(client_sock, caddr, clen);
-    }
+    for (DWORD i = 0; i < sysInfo.dwNumberOfProcessors * 2; ++i) // CPU 코어 수 * 2 만큼 미리 AcceptEx 요청
+        PostAccept();
 
-    if (listen_sock != INVALID_SOCKET)
-    {
-        closesocket(listen_sock);
-        listen_sock = INVALID_SOCKET;
-    }
+    return; // main 스레드 종료, accept는 worker에서 처리
 }
 
 void IocpServer::MakeWorkerThread()
@@ -143,12 +134,133 @@ void IocpServer::BindAndListen()
     std::cout << "[TCP SERVER] PORT: " << port << ", " << (af == AF_INET ? "IPv4" : "IPv6") << " START" << std::endl;
 }
 
-SOCKET IocpServer::AcceptClient(sockaddr_storage &caddr, socklen_t &clen)
+bool IocpServer::LoadAcceptEx() // AcceptEx 함수 포인터 로드
 {
-    SOCKET client_sock = accept(listen_sock, (sockaddr *)&caddr, &clen);
-    if (client_sock == INVALID_SOCKET)
-        err_display("accept()");
-    return client_sock;
+    DWORD bytes = 0;
+
+    GUID guidAcceptEx = WSAID_ACCEPTEX;
+    if (WSAIoctl(listen_sock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guidAcceptEx, sizeof(guidAcceptEx),
+                 &lpfnAcceptEx, sizeof(lpfnAcceptEx),
+                 &bytes, nullptr, nullptr) == SOCKET_ERROR)
+    {
+        err_display("WSAIOctl(AcceptEx)");
+        return false;
+    }
+
+    GUID guidGetAddrs = WSAID_GETACCEPTEXSOCKADDRS;
+    if (WSAIoctl(listen_sock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guidGetAddrs, sizeof(guidGetAddrs),
+                 &lpfnGetAcceptExSockaddrs, sizeof(lpfnGetAcceptExSockaddrs),
+                 &bytes, nullptr, nullptr) == SOCKET_ERROR)
+    {
+        err_display("WSAIOctl(GetAcceptExSockaddrs)");
+        return false;
+    }
+
+    return true;
+}
+
+bool IocpServer::PostAccept() // AcceptEx 비동기 접속 대기 요청
+{
+    if (!lpfnAcceptEx || listen_sock == INVALID_SOCKET)
+        return false;
+
+    IoContext *ctx = IoContext::CreateAccept(af);
+    if (!ctx)
+        return false;
+
+    DWORD bytes = 0;
+    const DWORD addrLen = sizeof(sockaddr_storage) + 16;
+
+    BOOL ok = lpfnAcceptEx(
+        listen_sock,
+        ctx->sock,
+        ctx->acceptBuf.data(),
+        0,
+        addrLen,
+        addrLen,
+        &bytes,
+        &ctx->overlapped);
+
+    if (!ok)
+    {
+        int err = WSAGetLastError();
+        if (err != ERROR_IO_PENDING)
+        {
+            err_display("AcceptEx()");
+            closesocket(ctx->sock);
+            delete ctx;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void IocpServer::HandleAcceptComplete(IoContext *ctx, DWORD cbTransferred, BOOL ok) // AcceptEx 완료 처리
+{
+    if (!ctx) // 정상적인 IoContext 포인터가 아니면
+        return;
+
+    if (!ok) // AcceptEx 실패 시
+    {
+        if (ctx->sock != INVALID_SOCKET) //  소켓 닫기
+            closesocket(ctx->sock);
+        delete ctx;
+
+        if (IsRunning())  // 서버가 실행 중이면
+            PostAccept(); // 다시 접속 대기 요청
+        return;
+    }
+
+    if (setsockopt(ctx->sock, // AcceptEx로 생성된 소켓 옵션 설정?
+                   SOL_SOCKET,
+                   SO_UPDATE_ACCEPT_CONTEXT,
+                   (char *)&listen_sock,
+                   sizeof(listen_sock)) == SOCKET_ERROR)
+    {
+        err_display("setsockopt(SO_UPDATE_ACCEPT_CONTEXT)"); // 소켓 옵션 설정 실패 시
+        closesocket(ctx->sock);
+        delete ctx;
+
+        if (IsRunning())
+            PostAccept();
+        return;
+    }
+
+    sockaddr *localAddr = nullptr;  // 로컬(server) 주소 추출
+    sockaddr *clientAddr = nullptr; // client 주소 추출
+    int localLen = 0;
+    int clientLen = 0;
+
+    const DWORD addrLen = sizeof(sockaddr_storage) + 16; //
+
+    lpfnGetAcceptExSockaddrs(
+        ctx->acceptBuf.data(),
+        0,
+        addrLen, addrLen,
+        &localAddr, &localLen,
+        &clientAddr, &clientLen);
+
+    sockaddr_storage caddr{};
+    socklen_t clen = 0;
+
+    if (clientAddr && clientLen > 0) // client 주소가 유효하면
+    {
+        std::memcpy(&caddr, clientAddr, (size_t)clientLen);
+        clen = (socklen_t)clientLen;
+    }
+
+    if (clen > 0) // client 주소 길이가 0보다 크면
+        PrintClientInfo(caddr, clen, 0);
+
+    IocpStart(ctx->sock, caddr, clen); // 새 세션 생성 및 IOCP 시작
+
+    delete ctx; // IoContext 메모리 해제, iocpStart에서 WSARecv용 IoContext 생성
+
+    if (IsRunning())
+        PostAccept();
 }
 
 void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen, bool type)
@@ -177,28 +289,29 @@ void IocpServer::PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen, 
 
 void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, socklen_t clen)
 {
-    // 소켓과 입출력 완료 포트 연결
-    HANDLE h = CreateIoCompletionPort((HANDLE)client_sock, iocpHandle, (ULONG_PTR)client_sock, 0);
-    if (h == nullptr)
+    std::shared_ptr<Session> session = sessionRegistry.Add(client_sock, caddr, static_cast<int>(clen));
+    if (!session)
     {
-        err_display("CreateIoCompletionPort()");
         closesocket(client_sock);
         return;
     }
 
-    std::shared_ptr<Session> session = sessionRegistry.Add(client_sock, caddr, static_cast<int>(clen));
-
-    IoContext *ctx = new IoContext();
-    if (ctx == nullptr)
+    HANDLE h = CreateIoCompletionPort((HANDLE)client_sock, iocpHandle, (ULONG_PTR)session->sessionId, 0);
+    if (h == nullptr)
+    {
+        err_display("CreateIoCompletionPort()");
+        session->Close();
+        sessionRegistry.Remove(session->sessionId);
         return;
+    }
 
-    ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
-    ctx->type = IoType::Recv;
-    ctx->sock = client_sock;
-    ctx->sessionId = session->sessionId;
-
-    ctx->wsabuf.buf = ctx->recvBuf.data();
-    ctx->wsabuf.len = BUFSIZE;
+    IoContext *ctx = IoContext::CreateRecv(client_sock, session->sessionId);
+    if (ctx == nullptr)
+    {
+        session->Close();
+        sessionRegistry.Remove(session->sessionId);
+        return;
+    }
 
     // 비동기 수신 시작
     DWORD flags = 0;
@@ -216,22 +329,15 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
     std::string out;
     out += "나의 SessionId = " + std::to_string(session->sessionId) + "\n";
 
-    IoContext *sctx = new IoContext();
-    if (!sctx)
-        return;
-
-    ZeroMemory(&sctx->overlapped, sizeof(OVERLAPPED));
-    sctx->type = IoType::Send;
-    sctx->sock = client_sock;
-    sctx->sessionId = session->sessionId;
-
     std::vector<char> packet = BuildPacket(session->sessionId, 0, MsgType::ListResp, out.data(), out.size());
 
-    sctx->sendBuf = std::make_shared<std::vector<char>>(std::move(packet));
-    sctx->sendOffset = 0;
-
-    sctx->wsabuf.buf = reinterpret_cast<char *>(sctx->sendBuf->data());
-    sctx->wsabuf.len = static_cast<ULONG>(sctx->sendBuf->size());
+    IoContext *sctx = IoContext::CreateSend(client_sock, session->sessionId, std::make_shared<std::vector<char>>(std::move(packet))); // ?
+    if (!sctx)
+    {
+        session->Close();
+        sessionRegistry.Remove(session->sessionId);
+        return;
+    }
 
     int sr = WSASend(client_sock, &sctx->wsabuf, 1, nullptr, 0, &sctx->overlapped, nullptr);
     if (sr == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING)
@@ -244,7 +350,6 @@ void IocpServer::IocpStart(SOCKET client_sock, const sockaddr_storage &caddr, so
 DWORD WINAPI IocpServer::WorkerThread(void *arg)
 {
     HANDLE iocpHandle = static_cast<HANDLE>(arg);
-    static constexpr ULONG_PTR exitKey = 0xDEAD;
 
     // 종료 중에도 completion packet이 남아있을 수 있으므로, Stop()에서 Session 종료(소켓 닫기) 후 while 탈출(break)
     while (true)
@@ -268,18 +373,24 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             continue;
 
         IoContext *ctx = reinterpret_cast<IoContext *>(lpOv);
+        if (ctx->type == IoType::Accept) // AcceptEx 완료 처리
+        {
+            HandleAcceptComplete(ctx, cbTransferred, ok);
+            continue;
+        }
 
-        std::shared_ptr<Session> session = sessionRegistry.Find(ctx->sessionId);
+        const std::uint32_t sid = static_cast<std::uint32_t>(completionKey);
+        std::shared_ptr<Session> session = sessionRegistry.Find(sid);
 
         // shutdown/에러/원격종료/세션 미존재 => 자원 정리로 수렴
         if (!ok || cbTransferred == 0 || !session || !session->IsAlive())
         {
             if (session)
             {
-                // 종료 로그
-                PrintClientInfo(session->remoteAddr, session->remoteAddrLen, 1);
-                session->Close();
-                sessionRegistry.Remove(ctx->sessionId);
+                if (session->Close()) // Close()가 최초 호출된 경우에만 종료 로그 출력
+                    PrintClientInfo(session->remoteAddr, session->remoteAddrLen, 1);
+
+                sessionRegistry.Remove(sid);
             }
 
             delete ctx;
@@ -307,23 +418,17 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
 
                 const std::uint32_t payloadLen = ntohl(header.payloadLen);
                 const std::uint32_t toSid = ntohl(header.to);
-                const std::uint32_t fromSid = ntohl(header.from);
+                // const std::uint32_t fromSid = ntohl(header.from);
                 const MsgType msgType = static_cast<MsgType>(ntohs(header.type));
                 const std::uint16_t reserved = ntohs(header.reserved);
 
                 if (available < PacketHeaderSize + payloadLen)
                     break; // payload가 아직 덜 옴
 
-                // 패킷 1개 완성 -> Task 생성
-                Task task;
-                task.type = TaskType::RecvMessage;
-                task.fromSid = ctx->sessionId;
-                task.toSid = toSid;
-                task.msgType = msgType;
-                task.reserved = reserved;
-
                 const char *payloadStart = ctx->streamBuf.data() + consumed + PacketHeaderSize;
-                task.data.assign(payloadStart, payloadStart + payloadLen);
+
+                Task task = Task::MakeRecvMessage(sid, toSid, msgType, reserved,
+                                                  std::vector<char>(payloadStart, payloadStart + payloadLen));
 
                 taskQueue_.Push(std::move(task));
 
@@ -344,7 +449,7 @@ DWORD WINAPI IocpServer::WorkerThread(void *arg)
             {
                 err_display("WSARecv()");
                 session->Close();
-                sessionRegistry.Remove(ctx->sessionId);
+                sessionRegistry.Remove(sid);
                 delete ctx;
             }
             break;

@@ -9,6 +9,7 @@
 #include <array>
 #include <thread>
 #include <atomic>
+#include <mswsock.h> // AcceptEx
 
 class IocpServer
 {
@@ -28,6 +29,9 @@ protected:
     void MakeWorkerThread();
     void BindAndListen();
     SOCKET AcceptClient(sockaddr_storage &caddr, socklen_t &clen);
+    bool LoadAcceptEx();
+    bool PostAccept();
+    void HandleAcceptComplete(IoContext *ctx, DWORD cbTransferred, BOOL ok);
     void PrintClientInfo(const sockaddr_storage &caddr, socklen_t clen, bool type);
     void IocpStart(SOCKET client, const sockaddr_storage &caddr, socklen_t clen);
 
@@ -49,4 +53,10 @@ private:
 
     TaskQueue taskQueue_;
     TaskThread taskThread_{sessionRegistry, taskQueue_};
+
+    LPFN_ACCEPTEX lpfnAcceptEx = nullptr;
+    LPFN_GETACCEPTEXSOCKADDRS lpfnGetAcceptExSockaddrs = nullptr;
+
+    static constexpr ULONG_PTR exitKey = 0xDEAD;
+    static constexpr ULONG_PTR listenKey = 0;
 };
